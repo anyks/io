@@ -23,19 +23,19 @@ jobs:
 
       - name: Configure (Release, POSIX)
         if: runner.os != 'Windows'
-        run: cmake --preset release
+        run: cmake --preset release -DCMAKE_VERBOSE_MAKEFILE=ON
 
       - name: Build (Release, POSIX)
         if: runner.os != 'Windows'
-        run: cmake --build --preset release -j
+        run: cmake --build --preset release -j --verbose
 
       - name: Configure (Release, MSVC)
         if: runner.os == 'Windows'
-        run: cmake -S . -B build/release -G "Visual Studio 17 2022" -A x64 -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build/release -G "Visual Studio 17 2022" -A x64 -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_VERBOSE_MAKEFILE=ON
 
       - name: Build (Release, MSVC)
         if: runner.os == 'Windows'
-        run: cmake --build build/release --config Release --target io io_tests example_client example_server
+        run: cmake --build build/release --config Release --target io io_tests example_client example_server --verbose
 
       - name: Package (CPack TGZ)
         shell: bash

@@ -12,9 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (Debug)
-        run: cmake --preset debug
+        run: cmake --preset debug -DCMAKE_VERBOSE_MAKEFILE=ON
       - name: Build (Debug)
-        run: cmake --build --preset debug -j
+        run: cmake --build --preset debug -j --verbose
       - name: Test (Debug)
         run: ctest --preset debug
 
@@ -27,9 +27,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (${{ matrix.preset }})
-        run: cmake --preset ${{ matrix.preset }}
+        run: cmake --preset ${{ matrix.preset }} -DCMAKE_VERBOSE_MAKEFILE=ON
       - name: Build (${{ matrix.preset }})
-        run: cmake --build --preset ${{ matrix.preset }} -j
+        run: cmake --build --preset ${{ matrix.preset }} -j --verbose
       - name: Test (${{ matrix.preset }})
         run: ctest --preset ${{ matrix.preset }}
 
@@ -42,9 +42,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y liburing-dev
       - name: Configure (io_uring Debug)
-        run: cmake -S . -B build/iouring -DIO_WITH_IOURING=ON -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S . -B build/iouring -DIO_WITH_IOURING=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_VERBOSE_MAKEFILE=ON
       - name: Build (io_uring Debug)
-        run: cmake --build build/iouring -j
+        run: cmake --build build/iouring -j --verbose
       - name: Test (io_uring Debug)
         run: ctest --test-dir build/iouring --output-on-failure
 

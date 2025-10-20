@@ -110,8 +110,8 @@ TEST(NetTimeout, DisableTimeout) {
   int srvfd = server_client_fd.load(std::memory_order_acquire);
   ASSERT_TRUE(engine->add_socket(srvfd, server_buf, sizeof(server_buf), [&](int, char*, size_t){}));
   // Set then disable
-  ASSERT_TRUE(engine->set_read_timeout(server_client_fd, 200));
-  ASSERT_TRUE(engine->set_read_timeout(server_client_fd, 0));
+  ASSERT_TRUE(engine->set_read_timeout(srvfd, 200));
+  ASSERT_TRUE(engine->set_read_timeout(srvfd, 0));
 
   // Ensure no close within 500ms
   std::atomic<int> close_count{0};
