@@ -1,0 +1,25 @@
+# Build directories
+build/
+_install/
+
+# CMake artifacts (if generated in source dir)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# IDE/editor
+.vscode/
+.idea/
+*.user
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.swp
+*.swo
+*.tmp
