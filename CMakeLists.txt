@@ -143,9 +143,9 @@ if (IO_BUILD_TESTS)
     target_link_libraries(io_tests PRIVATE io GTest::gtest_main)
   endif()
   include(GoogleTest)
-  # Ensure tests won't hang forever: set a per-test timeout (can be overridden by CTest args)
+  # Ensure tests won't hang forever: set a global per-test timeout (can be overridden by CTest args)
   gtest_discover_tests(io_tests)
-  set_tests_properties(io_tests PROPERTIES TIMEOUT 120)
+  set(CTEST_TEST_TIMEOUT 120)
 endif()
 
 # Install rules
