@@ -19,6 +19,7 @@
 #include <deque>
 #include <atomic>
 #include <cstdio>
+#include <cstdarg>
 
 #ifndef NDEBUG
 static inline void io_kq_log_err_impl(const char* fmt, ...) {
@@ -158,6 +159,11 @@ bool KqueueEngine::connect(socket_t fd, const char* host, uint16_t port, bool as
   int cur = fcntl(fd, F_GETFL, 0); if (cur < 0) cur = 0; fcntl(fd, F_SETFL, cur | O_NONBLOCK);
   if (res == 0 || err == EISCONN) {
     // Подписываемся на чтение и уведомляем
+    // Для единообразия залогируем SO_ERROR (обычно 0 при мгновенном успехе)
+    int soerr = 0; socklen_t sl = sizeof(soerr);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0) {
+      IO_LOG_DBG("connect completion fd=%d, SO_ERROR=%d (%s)", (int)fd, soerr, std::strerror(soerr));
+    }
     struct kevent ev{}; EV_SET(&ev, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr); (void)::kevent(kq_, &ev, 1, nullptr, 0, nullptr);
     IO_LOG_DBG("connect: established fd=%d", (int)fd);
     if (cbs_.on_accept) cbs_.on_accept(fd);

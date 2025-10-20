@@ -61,7 +61,12 @@ int main(){
   socket_t listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd == kInvalidSocket) { std::cerr << "socket() failed" << std::endl; return 1; }
   sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(8080); addr.sin_addr.s_addr = INADDR_ANY;
-  int opt=1; setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  int opt=1;
+#if defined(_WIN32) || defined(_WIN64)
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#else
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
   if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr))<0) { perror("bind"); return 1; }
   if (listen(listen_fd, 64)<0) { perror("listen"); return 1; }
 
