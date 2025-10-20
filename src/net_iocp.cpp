@@ -601,6 +601,6 @@ VOID CALLBACK IocpEngine::on_autotune_timer(PVOID param, BOOLEAN) {
 
 INetEngine* create_engine_iocp() { return new IocpEngine(); }
 
-} // namespace io
+}; // namespace io
 
 #endif

@@ -327,6 +327,6 @@ bool KqueueEngine::resume_read(socket_t socket) {
   return true;
 }
 
-} // namespace io
+}; // namespace io
 
 #endif

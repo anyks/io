@@ -205,6 +205,6 @@ private:
 
 INetEngine* create_engine_eventports() { return new EventPortsEngine(); }
 
-} // namespace io
+}; // namespace io
 
 #endif

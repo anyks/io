@@ -447,6 +447,6 @@ private:
 
 INetEngine* create_engine_iouring() { return new IouringEngine(); }
 
-} // namespace io
+}; // namespace io
 
 #endif

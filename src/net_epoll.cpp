@@ -18,6 +18,7 @@
 #include <atomic>
 #include <sys/timerfd.h>
 #include <cstdio>
+#include <cstdint>
 
 #ifndef NDEBUG
 #  define IO_LOG_ERR(fmt, ...) std::fprintf(stderr, "[io/epoll][ERR] " fmt "\n", ##__VA_ARGS__)
@@ -198,6 +199,7 @@ private:
 
 INetEngine* create_engine_epoll() { return new EpollEngine(); }
 
-} // namespace io
+}; // namespace io
+
 
 #endif

@@ -158,6 +158,6 @@ private:
 
 INetEngine* create_engine_devpoll() { return new DevPollEngine(); }
 
-} // namespace io
+}; // namespace io
 
 #endif

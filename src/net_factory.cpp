@@ -28,4 +28,4 @@ INetEngine* create_engine() {
 #endif
 }
 
-} // namespace io
+}; // namespace io

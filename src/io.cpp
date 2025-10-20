@@ -40,4 +40,4 @@ std::vector<std::string_view> split_lines(std::string_view text) {
     return result;
 }
 
-} // namespace io
+}; // namespace io
