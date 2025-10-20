@@ -293,6 +293,20 @@ ctest --test-dir ./build/tsan -R NetHighload.ManyClientsEchoNoBlock --repeat-unt
 - Авто‑тюнинг AcceptEx доступен только для IOCP (Windows); на других бэкендах вызовы возвращают `true`, но не меняют поведение.
 - Solaris /dev/poll: таймеры чтения эмулируются через pipe и фоновые потоки per-socket; это влияет на масштабируемость при очень большом числе тайм-аутов.
 - Логирование: диагностические логи (включая SO_ERROR при завершении connect) активны только в Debug‑сборках; для Release см. раздел «Включение расширенного логирования».
+
+## Релиз (tag → артефакты)
+
+Готов релизный workflow (GitHub Actions), который собирает пакеты (CPack TGZ) на Linux/macOS/Windows и публикует их в GitHub Release при пуше тега `v*`.
+
+Шаги:
+```bash
+# 1) Обновите CHANGELOG.md и при необходимости версию (docs)
+# 2) Создайте тег и запушьте
+git tag v0.1.0
+git push origin v0.1.0
+
+# 3) Дождитесь завершения workflow Release в Actions; пакеты будут прикреплены к релизу
+```
 ## Сборка с io_uring (Linux)
 
 Поддержка io_uring отключена по умолчанию; для включения:

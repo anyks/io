@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-packages:
+    name: Build packages (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get version from tag
+        id: getver
+        shell: bash
+        run: echo "ver=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Configure (Release, POSIX)
+        if: runner.os != 'Windows'
+        run: cmake --preset release
+
+      - name: Build (Release, POSIX)
+        if: runner.os != 'Windows'
+        run: cmake --build --preset release -j
+
+      - name: Configure (Release, MSVC)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build/release -G "Visual Studio 17 2022" -A x64 -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (Release, MSVC)
+        if: runner.os == 'Windows'
+        run: cmake --build build/release --config Release --target io io_tests example_client example_server
+
+      - name: Package (CPack TGZ)
+        shell: bash
+        run: |
+          cpack -C Release -G TGZ -B build/release
+          ls -l build/release || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: io-${{ steps.getver.outputs.ver }}-${{ runner.os }}
+          path: |
+            build/release/*.tar.gz
+            build/release/*.tgz
+
+  publish:
+    needs: [build-packages]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
