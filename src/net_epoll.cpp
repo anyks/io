@@ -18,13 +18,14 @@
 #include <atomic>
 #include <sys/timerfd.h>
 #include <cstdio>
+#include <cstdarg>
 
 #ifndef NDEBUG
-#  define IO_LOG_ERR(fmt, ...) std::fprintf(stderr, "[io/epoll][ERR] " fmt "\n", ##__VA_ARGS__)
-#  define IO_LOG_DBG(fmt, ...) std::fprintf(stderr, "[io/epoll][DBG] " fmt "\n", ##__VA_ARGS__)
+#  define IO_LOG_ERR(...) do { std::fprintf(stderr, "[io/epoll][ERR] "); std::fprintf(stderr, __VA_ARGS__); std::fprintf(stderr, "\n"); } while(0)
+#  define IO_LOG_DBG(...) do { std::fprintf(stderr, "[io/epoll][DBG] "); std::fprintf(stderr, __VA_ARGS__); std::fprintf(stderr, "\n"); } while(0)
 #else
-#  define IO_LOG_ERR(fmt, ...) ((void)0)
-#  define IO_LOG_DBG(fmt, ...) ((void)0)
+#  define IO_LOG_ERR(...) ((void)0)
+#  define IO_LOG_DBG(...) ((void)0)
 #endif
 
 namespace io {
@@ -55,7 +56,16 @@ public:
   bool add_socket(socket_t fd, char* buffer, size_t buffer_size, ReadCallback cb) override {
     int flags = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     { std::lock_guard<std::mutex> lk(mtx_); sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false}; }
-    epoll_event ev{}; ev.events = EPOLLIN | EPOLLRDHUP; ev.data.fd = fd; if (::epoll_ctl(ep_, EPOLL_CTL_ADD, fd, &ev) != 0) { IO_LOG_ERR("epoll_ctl(ADD fd=%d) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno)); return false; } return true;
+    epoll_event ev{}; ev.events = EPOLLIN | EPOLLRDHUP; ev.data.fd = fd;
+    if (::epoll_ctl(ep_, EPOLL_CTL_ADD, fd, &ev) != 0) {
+      if (errno == EEXIST) {
+        (void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
+      } else {
+        IO_LOG_ERR("epoll_ctl(ADD fd=%d) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno));
+        return false;
+      }
+    }
+    return true;
   }
   bool delete_socket(socket_t fd) override {
     if (::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr) != 0) { IO_LOG_ERR("epoll_ctl(DEL fd=%d) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno)); }
@@ -92,7 +102,16 @@ public:
   bool accept(socket_t listen_socket, bool async, uint32_t max_connections) override {
     if (async) { int flags = fcntl(listen_socket, F_GETFL, 0); fcntl(listen_socket, F_SETFL, flags | O_NONBLOCK); }
     max_conn_ = max_connections; { std::lock_guard<std::mutex> lk(mtx_); listeners_.insert(listen_socket); }
-    epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = listen_socket; if (::epoll_ctl(ep_, EPOLL_CTL_ADD, listen_socket, &ev) != 0) { IO_LOG_ERR("epoll_ctl(ADD listen fd=%d) failed errno=%d (%s)", (int)listen_socket, errno, std::strerror(errno)); return false; } return true;
+    epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = listen_socket;
+    if (::epoll_ctl(ep_, EPOLL_CTL_ADD, listen_socket, &ev) != 0) {
+      if (errno == EEXIST) {
+        (void)::epoll_ctl(ep_, EPOLL_CTL_MOD, listen_socket, &ev);
+      } else {
+        IO_LOG_ERR("epoll_ctl(ADD listen fd=%d) failed errno=%d (%s)", (int)listen_socket, errno, std::strerror(errno));
+        return false;
+      }
+    }
+    return true;
   }
   bool write(socket_t fd, const char* data, size_t data_size) override {
     std::lock_guard<std::mutex> lk(mtx_); auto it = sockets_.find(fd); if (it == sockets_.end()) return false; auto& st = it->second;

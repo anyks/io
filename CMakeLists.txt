@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Prefer modern timestamp behavior for URL extractions to avoid dev warnings
+if (POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
+endif()
+
 # Project
 project(io LANGUAGES CXX VERSION 0.1.0)
 
@@ -65,7 +70,7 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
       target_link_libraries(io PRIVATE ${URING_LIBRARY})
       target_sources(io PRIVATE src/net_iouring.cpp)
     else()
-      message(WARNING "liburing not found; falling back to epoll engine")
+      message(STATUS "liburing not found; falling back to epoll engine")
       target_compile_definitions(io PUBLIC IO_ENGINE_EPOLL)
       target_sources(io PRIVATE src/net_epoll.cpp)
     endif()
@@ -124,6 +129,7 @@ if (IO_BUILD_TESTS)
   FetchContent_Declare(
     googletest
     URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
   )
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)

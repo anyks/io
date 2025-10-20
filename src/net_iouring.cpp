@@ -221,6 +221,9 @@ private:
                 if (cbs_.on_accept) cbs_.on_accept(client);
                 // auto-recv only after user adds socket with buffer via add_socket
               }
+            } else {
+              int e = -res; if (e < 0) e = errno;
+              IO_LOG_ERR("accept completion failed listen=%d errno=%d (%s)", (int)listen_fd, e, std::strerror(e));
             }
             submit_accept(listen_fd); // re-arm accept regardless of res
             break;
@@ -380,9 +383,10 @@ private:
   void submit_accept(socket_t listen_fd) {
     io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
     UringData* ud = new UringData{Op::Accept, listen_fd, 0};
-    // Use accept4 with non-blocking flag for safety
-    static sockaddr_storage ss; static socklen_t slen = sizeof(ss);
-    io_uring_prep_accept(sqe, listen_fd, (sockaddr*)&ss, &slen, SOCK_NONBLOCK);
+    // Prepare sockaddr and reset len for each submit; avoid SOCK_NONBLOCK for wider kernel compatibility
+    static sockaddr_storage ss; static socklen_t slen;
+    slen = (socklen_t)sizeof(ss);
+    io_uring_prep_accept(sqe, listen_fd, (sockaddr*)&ss, &slen, 0);
     io_uring_sqe_set_data(sqe, ud);
     if (io_uring_submit(&ring_) < 0) { IO_LOG_ERR("io_uring_submit(accept listen=%d) failed", (int)listen_fd); }
   }
