@@ -40,7 +40,11 @@ jobs:
       - name: Package (CPack TGZ)
         shell: bash
         run: |
-          cpack -C Release -G TGZ -B build/release
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cpack -C Release -G TGZ --config build/release/CPackConfig.cmake
+          else
+            (cd build/release && cpack -C Release -G TGZ)
+          fi
           ls -l build/release || true
 
       - name: Upload artifact

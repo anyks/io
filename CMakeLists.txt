@@ -18,6 +18,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Threads (for std::thread on POSIX)
+find_package(Threads REQUIRED)
+
 # Warnings and default flags
 if (MSVC)
   add_compile_options(/W4 /permissive-)
@@ -95,6 +98,7 @@ target_include_directories(io
 
 # Interface usage requirements
 target_compile_features(io PUBLIC cxx_std_17)
+target_link_libraries(io PUBLIC Threads::Threads)
 
 # Example application (optional)
 if (IO_BUILD_EXAMPLES)
