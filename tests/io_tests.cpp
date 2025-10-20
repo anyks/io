@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "io/io.hpp"
+#include <cstdio>
 
 TEST(IoTest, SplitLines) {
     auto v = io::split_lines("a\nb\n");

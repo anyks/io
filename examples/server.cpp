@@ -7,6 +7,7 @@
 #if defined(_WIN32) || defined(_WIN64)
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  pragma comment(lib, "Ws2_32.lib")
 #else
 #  include <sys/socket.h>
 #  include <netinet/in.h>
@@ -20,6 +21,11 @@ static inline void be32_write(uint32_t v, char* out) { uint32_t n = htonl(v); st
 
 int main(){
   using namespace io;
+
+#if defined(_WIN32) || defined(_WIN64)
+  WSADATA wsaData;
+  if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) { std::cerr << "WSAStartup failed" << std::endl; return 1; }
+#endif
 
   auto* engine = create_engine();
   if (!engine) { std::cerr << "No engine available for this platform" << std::endl; return 1; }
@@ -72,4 +78,8 @@ int main(){
     ::sleep(1);
 #endif
   }
+
+#if defined(_WIN32) || defined(_WIN64)
+  WSACleanup();
+#endif
 }

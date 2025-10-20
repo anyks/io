@@ -11,6 +11,7 @@
 #if defined(_WIN32) || defined(_WIN64)
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  pragma comment(lib, "Ws2_32.lib")
 #else
 #  include <sys/socket.h>
 #  include <arpa/inet.h>
@@ -38,6 +39,11 @@ static inline uint32_t be32_read(const char* in) {
 
 int main(){
   using namespace io;
+
+#if defined(_WIN32) || defined(_WIN64)
+  WSADATA wsaData;
+  if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) { std::cerr << "WSAStartup failed" << std::endl; return 1; }
+#endif
 
   auto* engine = create_engine();
   if (!engine) { std::cerr << "No engine" << std::endl; return 1; }
@@ -126,5 +132,8 @@ int main(){
 
   engine->disconnect(fd);
   engine->destroy();
+#if defined(_WIN32) || defined(_WIN64)
+  WSACleanup();
+#endif
   return exit_code.load();
 }
