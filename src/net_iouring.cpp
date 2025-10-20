@@ -68,7 +68,13 @@ public:
     int flags = fcntl(fd, F_GETFL, 0); if (flags < 0) flags = 0; fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     std::lock_guard<std::mutex> lk(mtx_);
     sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false};
-    submit_recv(fd);
+    // Avoid flooding SQ with recv before a connection is actually established.
+    // If the socket is connected (e.g., server-accepted), start reading now; for
+    // client sockets, we'll submit recv after connect completion.
+    sockaddr_storage ss{}; socklen_t slen = sizeof(ss);
+    if (::getpeername(fd, (sockaddr*)&ss, &slen) == 0) {
+      submit_recv(fd);
+    }
     return true;
   }
 
@@ -363,7 +369,9 @@ private:
     std::lock_guard<std::mutex> lk(mtx_);
     auto it = sockets_.find(fd); if (it == sockets_.end()) return; auto& st = it->second; if (!st.buf || st.buf_size == 0) return;
     if (st.paused) return; // check if paused
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
+    std::lock_guard<std::mutex> rk(ring_mtx_);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) { (void)io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) { IO_LOG_ERR("no SQE available for recv fd=%d", (int)fd); return; } }
     UringData* ud = new UringData{Op::Read, fd, 0};
     io_uring_prep_recv(sqe, fd, st.buf, st.buf_size, 0);
     io_uring_sqe_set_data(sqe, ud);
@@ -373,7 +381,9 @@ private:
   void submit_send(socket_t fd) {
     std::lock_guard<std::mutex> lk(mtx_);
     auto it = sockets_.find(fd); if (it == sockets_.end()) return; auto& st = it->second; if (st.out_queue.empty()) return;
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
+    std::lock_guard<std::mutex> rk(ring_mtx_);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) { (void)io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) { IO_LOG_ERR("no SQE available for send fd=%d", (int)fd); return; } }
     UringData* ud = new UringData{Op::Write, fd, 0};
     io_uring_prep_send(sqe, fd, st.out_queue.data(), st.out_queue.size(), 0);
     io_uring_sqe_set_data(sqe, ud);
@@ -381,7 +391,8 @@ private:
   }
 
   void submit_accept(socket_t listen_fd) {
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
+    std::lock_guard<std::mutex> rk(ring_mtx_);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) { (void)io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) { IO_LOG_ERR("no SQE available for accept listen=%d", (int)listen_fd); return; } }
     UringData* ud = new UringData{Op::Accept, listen_fd, 0};
     // Prepare sockaddr and reset len for each submit; avoid SOCK_NONBLOCK for wider kernel compatibility
     static sockaddr_storage ss; static socklen_t slen;
@@ -392,7 +403,8 @@ private:
   }
 
   void submit_pollout(socket_t fd) {
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
+    std::lock_guard<std::mutex> rk(ring_mtx_);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) { (void)io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) { IO_LOG_ERR("no SQE available for pollout fd=%d", (int)fd); return; } }
     UringData* ud = new UringData{Op::Connect, fd, 1, nullptr};
     io_uring_prep_poll_add(sqe, fd, POLLOUT);
     io_uring_sqe_set_data(sqe, ud);
@@ -400,7 +412,8 @@ private:
   }
 
   void submit_connect(socket_t fd, const sockaddr_in& addr) {
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
+    std::lock_guard<std::mutex> rk(ring_mtx_);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) { (void)io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) { IO_LOG_ERR("no SQE available for connect fd=%d", (int)fd); return; } }
     // allocate a copy of address to ensure lifetime until completion
     auto* heap_addr = new sockaddr_in(addr);
     UringData* ud = new UringData{Op::Connect, fd, 2, heap_addr};
@@ -410,7 +423,8 @@ private:
   }
 
   void submit_read_user() {
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
+    std::lock_guard<std::mutex> rk(ring_mtx_);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) { (void)io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) { IO_LOG_ERR("no SQE available for user read"); return; } }
     UringData* ud = new UringData{Op::User, user_efd_, 0};
     // Using read on eventfd; it will complete when counter > 0
     io_uring_prep_read(sqe, user_efd_, &user_buf_, sizeof(user_buf_), 0);
@@ -421,7 +435,8 @@ private:
   void submit_timeout(socket_t fd, uint32_t ms) {
     // prepare relative timeout
     __kernel_timespec ts{}; ts.tv_sec = ms / 1000; ts.tv_nsec = (ms % 1000) * 1000000L;
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
+    std::lock_guard<std::mutex> rk(ring_mtx_);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) { (void)io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) { IO_LOG_ERR("no SQE available for timeout fd=%d", (int)fd); return; } }
     UringData* ud = new UringData{Op::Timeout, fd};
     // use ud pointer value as timeout key
     uint64_t key = (uint64_t)ud;
@@ -439,7 +454,8 @@ private:
   }
 
   void submit_timeout_remove(socket_t /*fd*/, uint64_t key) {
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) return;
+    std::lock_guard<std::mutex> rk(ring_mtx_);
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_); if (!sqe) { (void)io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) { IO_LOG_ERR("no SQE available for timeout_remove key=%llu", (unsigned long long)key); return; } }
     UringData* ud = new UringData{Op::TimeoutRemove, -1}; ud->u64 = key;
     io_uring_prep_timeout_remove(sqe, key, 0);
     io_uring_sqe_set_data(sqe, ud);
@@ -447,6 +463,7 @@ private:
   }
 
   uint64_t user_buf_{0};
+  std::mutex ring_mtx_;
 };
 
 INetEngine* create_engine_iouring() { return new IouringEngine(); }
