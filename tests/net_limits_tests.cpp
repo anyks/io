@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
+#include <algorithm>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
