@@ -1,5 +1,7 @@
 # io
 
+[![CI](https://github.com/anyks/io/actions/workflows/ci.yml/badge.svg)](https://github.com/anyks/io/actions/workflows/ci.yml)
+
 Кроссплатформенная библиотека событийного ввода-вывода и сетевого цикла на C++17 с несколькими бэкендами (kqueue/macOS, epoll/Linux, io_uring/Linux, IOCP/Windows, event ports/devpoll на Solaris). Библиотека предоставляет единый API для асинхронных операций, набор тестов (GoogleTest) и готовые пресеты санитайзеров (ASan/TSan/UBSan).
 
 Ключевые возможности

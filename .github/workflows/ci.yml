@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  linux-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Debug)
+        run: cmake --preset debug
+      - name: Build (Debug)
+        run: cmake --build --preset debug -j
+      - name: Test (Debug)
+        run: ctest --preset debug
+
+  linux-sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [ asan, ubsan, tsan ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (${{ matrix.preset }})
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build (${{ matrix.preset }})
+        run: cmake --build --preset ${{ matrix.preset }} -j
+      - name: Test (${{ matrix.preset }})
+        run: ctest --preset ${{ matrix.preset }}
+
+  linux-iouring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install liburing
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev
+      - name: Configure (io_uring Debug)
+        run: cmake -S . -B build/iouring -DIO_WITH_IOURING=ON -DCMAKE_BUILD_TYPE=Debug
+      - name: Build (io_uring Debug)
+        run: cmake --build build/iouring -j
+      - name: Test (io_uring Debug)
+        run: ctest --test-dir build/iouring --output-on-failure
+
+  macos-debug:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Debug)
+        run: cmake --preset debug
+      - name: Build (Debug)
+        run: cmake --build --preset debug -j
+      - name: Test (Debug)
+        run: ctest --preset debug
+
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (MSVC Debug)
+        run: cmake -S . -B build/win -G "Visual Studio 17 2022" -A x64 -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON
+      - name: Build (MSVC Debug)
+        run: cmake --build build/win --config Debug --target io io_tests example_client example_server
+      - name: Test (MSVC Debug)
+        run: ctest --test-dir build/win -C Debug --output-on-failure
