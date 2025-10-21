@@ -194,10 +194,12 @@ private:
       }
     }
   }
+}
 };
 
 INetEngine* create_engine_epoll() { return new EpollEngine(); }
 
-} // namespace io
+}; // namespace io
 
 #endif
+
