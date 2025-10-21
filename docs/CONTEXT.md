@@ -103,3 +103,38 @@ Share:
 - `dmesg` excerpts for io_uring-related errors
 
 This CONTEXT.md is designed to be read by the assistant to quickly regain full context on another machine.
+
+## Solaris over SSH (remote debug)
+
+Scripts in `scripts/solaris/` help sync/build/test on a remote Solaris host:
+
+- Copy `scripts/solaris/.env.example` to `.env` and adjust:
+  - `SOLARIS_SSH=user@host`, `SOLARIS_DIR=/opt/work/io`, `SOLARIS_BUILD=build/sol`
+  - `SOLARIS_EVENTPORTS=ON` to use Event Ports (default), OFF to fallback to /dev/poll
+
+Workflow from project root:
+
+```bash
+# 1) push sources
+scripts/solaris/solaris_sync.sh
+
+# 2) configure (Debug, tests/examples ON, Event Ports ON)
+scripts/solaris/solaris_configure.sh
+
+# 3) build
+scripts/solaris/solaris_build.sh
+
+# 4) run tests
+scripts/solaris/solaris_test.sh
+
+# 5) run examples (server+client)
+scripts/solaris/solaris_run_examples.sh
+
+# 6) debug a binary remotely with gdb
+scripts/solaris/solaris_gdb.sh io_tests
+```
+
+Notes
+- Ensure `cmake`/`ctest`/`gdb` are installed on Solaris. If needed, set absolute paths in `.env`.
+- Event Ports backend is enabled with `-DIO_WITH_EVENTPORTS=ON` (default). `/dev/poll` fallback with `OFF`.
+- If tests fail, grab failing output and share. For event ports timing issues, also check system logs.
