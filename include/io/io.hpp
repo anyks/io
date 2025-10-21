@@ -10,8 +10,8 @@ namespace io {
 // - write_file: write text to file (overwrite)
 // - split_lines: utility to split text by new lines
 
-std::string read_file(const std::string& path);
-void write_file(const std::string& path, std::string_view content);
+std::string read_file(const std::string &path);
+void write_file(const std::string &path, std::string_view content);
 std::vector<std::string_view> split_lines(std::string_view text);
 
 } // namespace io

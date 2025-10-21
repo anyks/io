@@ -3,7 +3,7 @@
 
 namespace io {
 #if defined(_WIN32) || defined(_WIN64)
-#  include <winsock2.h>
+#include <winsock2.h>
 using socket_t = SOCKET;
 constexpr socket_t kInvalidSocket = INVALID_SOCKET;
 #else
