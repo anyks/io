@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "generatedAt": "2025-10-21T00:00:00Z",
+  "branch": "main",
+  "language": "C++17",
+  "build": {
+    "system": "CMake",
+    "presets": ["debug", "release", "asan", "tsan", "ubsan"],
+    "globalCTestTimeoutSec": 120
+  },
+  "features": [
+    "async_accept",
+    "async_connect",
+    "async_read_write",
+    "post_user_event",
+    "per_socket_timeout",
+    "pause_resume_read",
+    "logging_hooks"
+  ],
+  "backends": {
+    "linux": ["epoll", "io_uring"],
+    "macos": ["kqueue"],
+    "windows": ["iocp"],
+    "solaris": ["eventports", "devpoll"]
+  },
+  "style": {
+    "clangFormat": {
+      "UseTab": "Always",
+      "IndentWidth": 4,
+      "TabWidth": 4,
+      "BreakBeforeBraces": "Attach",
+      "ColumnLimit": 120
+    }
+  },
+  "tests": {
+    "count": 13,
+    "status": "pass_on_macos",
+    "stress": {
+      "test": "NetHighload.ManyClientsEchoNoBlock",
+      "runs": 100,
+      "result": "pass"
+    }
+  },
+  "linux": {
+    "deps": [
+      "build-essential",
+      "cmake",
+      "pkg-config",
+      "clang",
+      "clang-format",
+      "llvm",
+      "liburing-dev",
+      "libasan5",
+      "libubsan1",
+      "libtsan0"
+    ],
+    "ctest": {
+      "dirs": ["build/debug", "build/asan", "build/tsan", "build/ubsan"],
+      "stress": {
+        "dir": "build/tsan",
+        "regex": "NetHighload.ManyClientsEchoNoBlock",
+        "repeat": 100
+      }
+    }
+  },
+  "next": [
+    "Validate io_uring on Linux",
+    "Collect logs if hangs or errors",
+    "Add style-check CI",
+    "Prepare release packaging"
+  ]
+}
