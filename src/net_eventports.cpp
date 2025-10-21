@@ -215,15 +215,19 @@ class EventPortsEngine : public INetEngine {
 	bool set_accept_depth_ex(socket_t /*listen_socket*/, uint32_t /*depth*/, bool /*aggressive_cancel*/) override { return true; }
 	bool set_accept_autotune(socket_t /*listen_socket*/, const AcceptAutotuneConfig &/*cfg*/) override { return true; }
 	bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
-		// Solaris 11.4: native timers via timer_create + SIGEV_PORT, posting to our event port (PORT_SOURCE_TIMER)
+		// Solaris 11.4: native timers via timer_create + SIGEV_PORT delivering PORT_SOURCE_TIMER to our port
+		struct TimerInfo {
+			timer_t id{};
+			uint32_t ms{0};
+			port_notify_t pn{};
+		};
 		if (timeout_ms == 0) {
 			std::lock_guard<std::mutex> lk(mtx_);
 			auto it = timers_.find(socket);
 			if (it != timers_.end()) {
-				timer_delete(it->second);
+				timer_delete(it->second.id);
 				timers_.erase(it);
 			}
-			timeouts_ms_.erase(socket);
 			return true;
 		}
 		{
@@ -231,35 +235,31 @@ class EventPortsEngine : public INetEngine {
 			if (sockets_.find(socket) == sockets_.end())
 				return false;
 		}
-		// Create timer if not present
 		timer_t tid{};
 		{
 			std::lock_guard<std::mutex> lk(mtx_);
 			auto it = timers_.find(socket);
 			if (it == timers_.end()) {
+				TimerInfo info{};
+				info.ms = timeout_ms;
+				std::memset(&info.pn, 0, sizeof(info.pn));
+				info.pn.portnfy_port = port_;
+				info.pn.portnfy_user = (void *)(intptr_t)socket;
+
 				struct sigevent sev{};
 				sev.sigev_notify = SIGEV_PORT;
-				// Pass socket id in user field and target port via notify attributes
-				// Note: On Solaris, for SIGEV_PORT the sigev_value.sival_ptr points to a port_notify_t, which specifies
-				// the port and user data.
-				struct port_notify pn{}; // alias type may be port_notify_t depending on headers
-				std::memset(&pn, 0, sizeof(pn));
-				pn.portnfy_port = port_;
-				pn.portnfy_user = (void *)(intptr_t)socket;
-				sev.sigev_value.sival_ptr = &pn;
-				// timer_create is expected to copy port_notify contents internally
-				if (timer_create(CLOCK_MONOTONIC, &sev, &tid) != 0) {
-					IO_LOG_ERR("timer_create failed errno=%d", errno);
+				sev.sigev_value.sival_ptr = &info.pn; // persistent storage while timer exists
+				if (timer_create(CLOCK_MONOTONIC, &sev, &info.id) != 0) {
+					IO_LOG_ERR("timer_create failed errno=%d (%s)", errno, std::strerror(errno));
 					return false;
 				}
-				timers_[socket] = tid;
-				timeouts_ms_[socket] = timeout_ms;
+				tid = info.id;
+				timers_.emplace(socket, info);
 			} else {
-				tid = it->second;
-				timeouts_ms_[socket] = timeout_ms;
+				it->second.ms = timeout_ms;
+				tid = it->second.id;
 			}
 		}
-		// Arm/rearm one-shot timeout
 		itimerspec its{};
 		its.it_value.tv_sec = timeout_ms / 1000;
 		its.it_value.tv_nsec = (timeout_ms % 1000) * 1000000L;
@@ -289,8 +289,8 @@ class EventPortsEngine : public INetEngine {
 	std::mutex mtx_;
 	std::unordered_map<socket_t, SockState> sockets_;
 	std::unordered_set<socket_t> listeners_;
-	std::unordered_map<socket_t, uint32_t> timeouts_ms_;
-	std::unordered_map<socket_t, timer_t> timers_;
+	struct TimerInfoStore { timer_t id{}; uint32_t ms{0}; port_notify_t pn{}; };
+	std::unordered_map<socket_t, TimerInfoStore> timers_;
 	std::atomic<uint32_t> max_conn_{0};
 	std::atomic<uint32_t> cur_conn_{0};
 
@@ -434,12 +434,9 @@ class EventPortsEngine : public INetEngine {
 								cur_conn_--;
 							auto itT = timers_.find(fd);
 							if (itT != timers_.end()) {
-								int tfd = itT->second;
-								::port_dissociate(port_, PORT_SOURCE_FD, tfd);
-								::close(tfd);
+								timer_delete(itT->second.id);
 								timers_.erase(itT);
 							}
-							timeouts_ms_.erase(fd);
 						}
 						// Rearm timer on successful read
 						if (rn > 0) {
