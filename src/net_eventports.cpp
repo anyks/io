@@ -82,7 +82,7 @@ class EventPortsEngine : public INetEngine {
 			std::lock_guard<std::mutex> lk(mtx_);
 			sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false, false};
 		}
-		if (::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLRDNORM | POLLRDHUP, nullptr) != 0) {
+		if (::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLRDNORM | POLLHUP, nullptr) != 0) {
 			IO_LOG_ERR("port_associate(fd=%d, POLLIN|...) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno));
 			return false;
 		}
@@ -120,14 +120,14 @@ class EventPortsEngine : public INetEngine {
 			cur = 0;
 		fcntl(fd, F_SETFL, cur | O_NONBLOCK);
 		if (r == 0) {
-			if (::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLRDNORM | POLLRDHUP, nullptr) != 0)
+			if (::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLRDNORM | POLLHUP, nullptr) != 0)
 				return false;
 			if (cbs_.on_accept)
 				cbs_.on_accept(fd);
 			return true;
 		}
 		if (async && (err == EINPROGRESS)) {
-			(void)::port_associate(port_, PORT_SOURCE_FD, fd, POLLOUT | POLLIN | POLLRDHUP, nullptr);
+			(void)::port_associate(port_, PORT_SOURCE_FD, fd, POLLOUT | POLLIN | POLLHUP, nullptr);
 			std::lock_guard<std::mutex> lk(mtx_);
 			sockets_[fd].connecting = true;
 			return true;
@@ -171,7 +171,7 @@ class EventPortsEngine : public INetEngine {
 		st.out_queue.insert(st.out_queue.end(), data, data + data_size);
 		if (!st.want_write) {
 			st.want_write = true;
-			(void)::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLOUT | POLLRDHUP, nullptr);
+			(void)::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLOUT | POLLHUP, nullptr);
 		}
 		return true;
 	}
@@ -181,7 +181,7 @@ class EventPortsEngine : public INetEngine {
 		if (it == sockets_.end())
 			return false;
 		it->second.paused = true;
-		short mask = POLLRDHUP;
+		short mask = POLLHUP;
 		if (it->second.want_write)
 			mask |= POLLOUT; // drop POLLIN
 		if (::port_associate(port_, PORT_SOURCE_FD, socket, mask, nullptr) != 0) {
@@ -196,7 +196,7 @@ class EventPortsEngine : public INetEngine {
 		if (it == sockets_.end())
 			return false;
 		it->second.paused = false;
-		short mask = POLLIN | POLLRDHUP;
+		short mask = POLLIN | POLLHUP;
 		if (it->second.want_write)
 			mask |= POLLOUT;
 		if (::port_associate(port_, PORT_SOURCE_FD, socket, mask, nullptr) != 0) {
@@ -211,6 +211,9 @@ class EventPortsEngine : public INetEngine {
 		ssize_t n = ::write(user_pipe_[1], &val, sizeof(val));
 		return n == (ssize_t)sizeof(val);
 	}
+	bool set_accept_depth(socket_t /*listen_socket*/, uint32_t /*depth*/) override { return true; }
+	bool set_accept_depth_ex(socket_t /*listen_socket*/, uint32_t /*depth*/, bool /*aggressive_cancel*/) override { return true; }
+	bool set_accept_autotune(socket_t /*listen_socket*/, const AcceptAutotuneConfig &/*cfg*/) override { return true; }
 	bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
 		// Solaris 11.4: native timers via timer_create + SIGEV_PORT, posting to our event port (PORT_SOURCE_TIMER)
 		if (timeout_ms == 0) {
@@ -333,7 +336,7 @@ class EventPortsEngine : public INetEngine {
 					continue;
 				}
 				if (ev.portev_source == PORT_SOURCE_FD) {
-					int fd = static_cast<int>(reinterpret_cast<intptr_t>(ev.portev_object));
+					int fd = static_cast<int>(ev.portev_object);
 					if (fd == user_pipe_[0]) {
 						uint32_t v;
 						while (::read(user_pipe_[0], &v, sizeof(v)) == sizeof(v)) {
@@ -470,13 +473,13 @@ class EventPortsEngine : public INetEngine {
 								st.out_queue.erase(st.out_queue.begin(), st.out_queue.begin() + wn);
 							}
 							if (st.out_queue.empty()) {
-								(void)::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLRDHUP, nullptr);
+								(void)::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLHUP, nullptr);
 								st.want_write = false;
 							}
 						}
 					}
 					// re-associate fd with new interest mask
-					short mask = POLLRDHUP;
+					short mask = POLLHUP;
 					{
 						std::lock_guard<std::mutex> lk(mtx_);
 						auto it = sockets_.find(fd);
