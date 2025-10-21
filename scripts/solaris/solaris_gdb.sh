@@ -11,7 +11,7 @@ fi
 
 TARGET=${1:-io_tests}
 
-ssh -tt "${SOLARIS_SSH}" bash -lc "'
+ssh -tt -p "${SOLARIS_SSH_PORT}" ${SOLARIS_SSH_OPTS} "${SOLARIS_SSH}" bash -lc "'
 set -euo pipefail
 cd "${SOLARIS_DIR}/${SOLARIS_BUILD}"
 if [[ ! -x "${TARGET}" ]]; then

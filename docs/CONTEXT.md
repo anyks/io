@@ -109,7 +109,8 @@ This CONTEXT.md is designed to be read by the assistant to quickly regain full c
 Scripts in `scripts/solaris/` help sync/build/test on a remote Solaris host:
 
 - Copy `scripts/solaris/.env.example` to `.env` and adjust:
-  - `SOLARIS_SSH=user@host`, `SOLARIS_DIR=/opt/work/io`, `SOLARIS_BUILD=build/sol`
+  - `SOLARIS_SSH=user@host`, `SOLARIS_SSH_PORT=222` (if non-default), optional `SOLARIS_SSH_OPTS` like `-o StrictHostKeyChecking=no`
+  - `SOLARIS_DIR=/opt/work/io`, `SOLARIS_BUILD=build/sol`
   - `SOLARIS_EVENTPORTS=ON` to use Event Ports (default), OFF to fallback to /dev/poll
 
 Workflow from project root:

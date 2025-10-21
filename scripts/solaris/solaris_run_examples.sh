@@ -9,7 +9,7 @@ else
   source scripts/solaris/.env.example
 fi
 
-ssh -tt "${SOLARIS_SSH}" bash -lc "'
+ssh -tt -p "${SOLARIS_SSH_PORT}" ${SOLARIS_SSH_OPTS} "${SOLARIS_SSH}" bash -lc "'
 set -euo pipefail
 cd "${SOLARIS_DIR}/${SOLARIS_BUILD}"
 echo "Server:"; ./example_server &

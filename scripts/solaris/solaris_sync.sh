@@ -9,7 +9,9 @@ else
   source scripts/solaris/.env.example
 fi
 
-rsync -avz --delete \
+RSYNC_SSH="ssh -p ${SOLARIS_SSH_PORT} ${SOLARIS_SSH_OPTS}"
+
+rsync -avz --delete -e "$RSYNC_SSH" \
   --exclude ".git/" \
   --exclude "build/" \
   --exclude "_install/" \
