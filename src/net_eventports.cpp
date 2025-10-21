@@ -343,6 +343,8 @@ class EventPortsEngine : public INetEngine {
 							if (cbs_.on_user)
 								cbs_.on_user(v);
 						}
+						// rearm user pipe
+						(void)::port_associate(port_, PORT_SOURCE_FD, user_pipe_[0], POLLIN, nullptr);
 						continue;
 					}
 					bool is_listener = false;
@@ -374,6 +376,8 @@ class EventPortsEngine : public INetEngine {
 							if (cbs_.on_accept)
 								cbs_.on_accept(client);
 						}
+						// Re-associate listener for next connection edge (event ports are one-shot)
+						(void)::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN, nullptr);
 						continue;
 					}
 					if (ev.portev_events & POLLOUT) {
@@ -473,7 +477,6 @@ class EventPortsEngine : public INetEngine {
 								st.out_queue.erase(st.out_queue.begin(), st.out_queue.begin() + wn);
 							}
 							if (st.out_queue.empty()) {
-								(void)::port_associate(port_, PORT_SOURCE_FD, fd, POLLIN | POLLHUP, nullptr);
 								st.want_write = false;
 							}
 						}
