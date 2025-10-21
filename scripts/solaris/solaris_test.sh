@@ -16,5 +16,12 @@ ssh -tt -p "${SOLARIS_SSH_PORT}" ${SOLARIS_SSH_OPTS} "${SOLARIS_SSH}" bash -s --
 set -euo pipefail
 SOLARIS_DIR="$1"; SOLARIS_BUILD="$2"; SOLARIS_CTEST="$3"
 cd "$SOLARIS_DIR"
-"$SOLARIS_CTEST" --test-dir "$SOLARIS_BUILD" --output-on-failure -j2
+LOG="$SOLARIS_BUILD/ctest_last.log"
+echo "[remote] Running ctest in $SOLARIS_BUILD (full verbose). Log: $LOG"
+set +e
+"$SOLARIS_CTEST" --test-dir "$SOLARIS_BUILD" --output-on-failure -j2 -VV 2>&1 | tee "$LOG"
+CTEST_RC=${PIPESTATUS[0]}
+set -e
+echo "[remote] ctest exit code: $CTEST_RC"
+exit "$CTEST_RC"
 REMOTE_SCRIPT
