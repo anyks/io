@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")"/..
+cd "$(dirname "$0")"/../..
 
 if [[ -f scripts/solaris/.env ]]; then
   source scripts/solaris/.env
