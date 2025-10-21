@@ -9,8 +9,12 @@ else
   source scripts/solaris/.env.example
 fi
 
-ssh -tt -p "${SOLARIS_SSH_PORT}" ${SOLARIS_SSH_OPTS} "${SOLARIS_SSH}" bash -lc "'
+ssh -tt -p "${SOLARIS_SSH_PORT}" ${SOLARIS_SSH_OPTS} "${SOLARIS_SSH}" \
+  SOLARIS_DIR="${SOLARIS_DIR}" \
+  SOLARIS_BUILD="${SOLARIS_BUILD}" \
+  SOLARIS_CTEST="${SOLARIS_CTEST}" \
+  bash -lc '
 set -euo pipefail
-cd "${SOLARIS_DIR}"
-${SOLARIS_CTEST} --test-dir "${SOLARIS_BUILD}" --output-on-failure -j2
-'"
+cd "$SOLARIS_DIR"
+"$SOLARIS_CTEST" --test-dir "$SOLARIS_BUILD" --output-on-failure -j2
+'
