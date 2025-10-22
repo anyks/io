@@ -12,6 +12,9 @@ jobs:
   windows-msys2:
     # Match your runner labels: use your custom label ANYKS
     runs-on: [ self-hosted, ANYKS ]
+    defaults:
+      run:
+        shell: cmd
     steps:
       - uses: actions/checkout@v4
 
