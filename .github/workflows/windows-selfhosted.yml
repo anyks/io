@@ -10,8 +10,8 @@ on:
 
 jobs:
   windows-msys2:
-    # Runner must have this label. Configure your runner with the label: ANYKS
-    runs-on: [ self-hosted, ANYKS ]
+    # Match your runner labels: self-hosted, Windows, ARM64
+    runs-on: [ self-hosted, Windows, ARM64 ]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,26 +21,35 @@ jobs:
           Write-Host "Runner OS: $env:RUNNER_OS"
           Write-Host "MSYS2 path exists: " (Test-Path "C:\msys64")
 
-      - name: Configure (MSYS2 MinGW64)
-        shell: cmd
+      - name: Select MSYS2 shell (clangarm64 preferred)
+        shell: powershell
         run: |
-          "C:\msys64\usr\bin\bash.exe" -lc "cmake -S . -B build/mingw -G 'Ninja' -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} -DIO_BUILD_TESTS=OFF -DIO_BUILD_EXAMPLES=ON"
+          $shell = "C:\\msys64\\clangarm64.exe"
+          if (-Not (Test-Path $shell)) {
+            $shell = "C:\\msys64\\usr\\bin\\bash.exe"
+          }
+          "BASH=$shell" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Build (MSYS2 MinGW64)
+      - name: Configure (MSYS2, ARM64 toolchain if present)
         shell: cmd
         run: |
-          "C:\msys64\usr\bin\bash.exe" -lc "cmake --build build/mingw -j"
+          "%BASH%" -lc "if [ -d /clangarm64/bin ]; then export PATH=/clangarm64/bin:$PATH; fi; cmake -S . -B build/arm64 -G 'Ninja' -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} -DIO_BUILD_TESTS=OFF -DIO_BUILD_EXAMPLES=ON"
+
+      - name: Build (MSYS2)
+        shell: cmd
+        run: |
+          "%BASH%" -lc "cmake --build build/arm64 -j"
 
       - name: List build outputs
         shell: cmd
         run: |
-          dir build\mingw
+          dir build\arm64
 
       - name: Upload artifacts (binaries)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-mingw64-${{ github.run_id }}
+          name: windows-arm64-${{ github.run_id }}
           path: |
-            build/mingw/**
+            build/arm64/**
           if-no-files-found: warn
