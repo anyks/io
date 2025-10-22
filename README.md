@@ -3,6 +3,7 @@
 [![CI](https://github.com/anyks/io/actions/workflows/ci.yml/badge.svg)](https://github.com/anyks/io/actions/workflows/ci.yml)
 [![Linux](https://img.shields.io/badge/Linux-tested-22c55e?logo=linux)](https://github.com/anyks/io/actions/workflows/ci.yml)
 [![macOS](https://img.shields.io/badge/macOS-tested-22c55e?logo=apple)](https://github.com/anyks/io/actions/workflows/ci.yml)
+[![Windows IOCP](https://img.shields.io/badge/Windows-IOCP%20WIP-f59e0b?logo=windows)](#заметки-для-windows-iocp)
 
 Кроссплатформенная библиотека событийного ввода-вывода и сетевого цикла на C++17 с несколькими бэкендами (kqueue/macOS, epoll/Linux, io_uring/Linux, IOCP/Windows, event ports/devpoll на Solaris). Библиотека предоставляет единый API для асинхронных операций, набор тестов (GoogleTest) и готовые пресеты санитайзеров (ASan/TSan/UBSan).
 
@@ -369,6 +370,8 @@ ctest --test-dir ./build/tsan -R NetHighload.ManyClientsEchoNoBlock --repeat-unt
 - Особенности отладки:
 	- Для подробных логов используйте Debug-конфигурацию. Для включения логов в Release см. раздел про расширенное логирование.
 	- Если запускаете в WSL — используйте Linux-сборку (epoll/io_uring); нативный IOCP доступен только в Windows.
+
+Примечание: GitHub Actions для Windows временно отключён; бэкенд доступен и собирается локально по инструкции выше.
 
 ## Заметки для Solaris (event ports/devpoll)
 
