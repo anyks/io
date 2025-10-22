@@ -371,6 +371,22 @@ ctest --test-dir ./build/tsan -R NetHighload.ManyClientsEchoNoBlock --repeat-unt
 	- Для подробных логов используйте Debug-конфигурацию. Для включения логов в Release см. раздел про расширенное логирование.
 	- Если запускаете в WSL — используйте Linux-сборку (epoll/io_uring); нативный IOCP доступен только в Windows.
 
+### Быстрая локальная сборка (MSYS2 MinGW64, x86_64)
+
+Если у вас установлен MSYS2 в `C:\msys64`, можно собрать библиотеку и примеры одним скриптом (тесты временно выключены):
+
+```bat
+scripts\windows\msys2\build.bat Debug
+```
+
+- По умолчанию сборка попадёт в `E:\io`. Изменить путь можно отредактировав `BUILD_WIN` внутри скрипта.
+- Скрипт автоматически выберет генератор: Ninja (если установлен) или MinGW Makefiles.
+- Для Release: `scripts\windows\msys2\build.bat Release`.
+- Если чего-то не хватает в MSYS2, установите в профиле "MSYS2 MinGW x64":
+  - `pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja`
+
+Примечание: Windows job в GitHub Actions для MSYS2/self-hosted существует, но его можно игнорировать — локальная отладка обычно быстрее и удобнее.
+
 Примечание: GitHub Actions для Windows временно отключён; бэкенд доступен и собирается локально по инструкции выше.
 
 ## Заметки для Solaris (event ports/devpoll)
