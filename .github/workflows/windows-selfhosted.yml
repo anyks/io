@@ -16,24 +16,22 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Print runner info
-        shell: powershell
+        shell: cmd
         run: |
-          Write-Host "Runner OS: $env:RUNNER_OS"
-          Write-Host "MSYS2 path exists: " (Test-Path "C:\msys64")
+          echo Runner OS: %RUNNER_OS%
+          if exist "C:\msys64" (echo MSYS2 path exists: True) else (echo MSYS2 path exists: False)
 
       - name: Select MSYS2 shell (mingw64 preferred)
-        shell: powershell
+        shell: cmd
         run: |
-          $shell = "C:\\msys64\\mingw64.exe"
-          if (-Not (Test-Path $shell)) {
-            $shell = "C:\\msys64\\usr\\bin\\bash.exe"
-          }
-          "BASH=$shell" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if exist "C:\msys64\mingw64.exe" (set BASH=C:\msys64\mingw64.exe)
+          if not exist "C:\msys64\mingw64.exe" (set BASH=C:\msys64\usr\bin\bash.exe)
+          echo BASH=%BASH%>> %GITHUB_ENV%
 
       - name: Ensure E:\io exists
-        shell: powershell
+        shell: cmd
         run: |
-          New-Item -ItemType Directory -Path "E:\\io" -Force | Out-Null
+          if not exist "E:\io" mkdir "E:\io"
 
       - name: Configure (MSYS2 MinGW64)
         shell: cmd
