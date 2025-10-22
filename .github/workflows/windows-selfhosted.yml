@@ -1,4 +1,4 @@
-name: Windows (self-hosted MSYS2)
+name: Windows (self-hosted MSYS2 MinGW64)
 
 on:
   workflow_dispatch:
@@ -10,8 +10,8 @@ on:
 
 jobs:
   windows-msys2:
-    # Match your runner labels: self-hosted, Windows, ARM64
-    runs-on: [ self-hosted, Windows, ARM64 ]
+    # Match your runner labels. Keep it generic to avoid arch mismatch.
+    runs-on: [ self-hosted, Windows ]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,35 +21,40 @@ jobs:
           Write-Host "Runner OS: $env:RUNNER_OS"
           Write-Host "MSYS2 path exists: " (Test-Path "C:\msys64")
 
-      - name: Select MSYS2 shell (clangarm64 preferred)
+      - name: Select MSYS2 shell (mingw64 preferred)
         shell: powershell
         run: |
-          $shell = "C:\\msys64\\clangarm64.exe"
+          $shell = "C:\\msys64\\mingw64.exe"
           if (-Not (Test-Path $shell)) {
             $shell = "C:\\msys64\\usr\\bin\\bash.exe"
           }
           "BASH=$shell" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Configure (MSYS2, ARM64 toolchain if present)
-        shell: cmd
+      - name: Ensure E:\io exists
+        shell: powershell
         run: |
-          "%BASH%" -lc "if [ -d /clangarm64/bin ]; then export PATH=/clangarm64/bin:$PATH; fi; cmake -S . -B build/arm64 -G 'Ninja' -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} -DIO_BUILD_TESTS=OFF -DIO_BUILD_EXAMPLES=ON"
+          New-Item -ItemType Directory -Path "E:\\io" -Force | Out-Null
 
-      - name: Build (MSYS2)
+      - name: Configure (MSYS2 MinGW64)
         shell: cmd
         run: |
-          "%BASH%" -lc "cmake --build build/arm64 -j"
+          "%BASH%" -lc "export PATH=/mingw64/bin:$PATH; BUILD_WIN='E:/io'; BUILD=$(cygpath -u \"$BUILD_WIN\"); cmake -S . -B \"$BUILD\" -G 'Ninja' -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} -DIO_BUILD_TESTS=OFF -DIO_BUILD_EXAMPLES=ON"
+
+      - name: Build (MSYS2 MinGW64)
+        shell: cmd
+        run: |
+          "%BASH%" -lc "export PATH=/mingw64/bin:$PATH; BUILD_WIN='E:/io'; BUILD=$(cygpath -u \"$BUILD_WIN\"); cmake --build \"$BUILD\" -j"
 
       - name: List build outputs
         shell: cmd
         run: |
-          dir build\arm64
+          dir E:\\io
 
       - name: Upload artifacts (binaries)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-arm64-${{ github.run_id }}
+          name: windows-mingw64-${{ github.run_id }}
           path: |
-            build/arm64/**
+            E:\\io\**
           if-no-files-found: warn
