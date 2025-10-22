@@ -1,0 +1,46 @@
+name: Windows (self-hosted MSYS2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: CMAKE_BUILD_TYPE (Debug/Release)
+        required: false
+        default: Debug
+
+jobs:
+  windows-msys2:
+    # Runner must have this label. Configure your runner with the label: ANYKS
+    runs-on: [ self-hosted, ANYKS ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print runner info
+        shell: powershell
+        run: |
+          Write-Host "Runner OS: $env:RUNNER_OS"
+          Write-Host "MSYS2 path exists: " (Test-Path "C:\msys64")
+
+      - name: Configure (MSYS2 MinGW64)
+        shell: cmd
+        run: |
+          "C:\msys64\usr\bin\bash.exe" -lc "cmake -S . -B build/mingw -G 'Ninja' -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} -DIO_BUILD_TESTS=OFF -DIO_BUILD_EXAMPLES=ON"
+
+      - name: Build (MSYS2 MinGW64)
+        shell: cmd
+        run: |
+          "C:\msys64\usr\bin\bash.exe" -lc "cmake --build build/mingw -j"
+
+      - name: List build outputs
+        shell: cmd
+        run: |
+          dir build\mingw
+
+      - name: Upload artifacts (binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mingw64-${{ github.run_id }}
+          path: |
+            build/mingw/**
+          if-no-files-found: warn
