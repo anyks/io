@@ -21,27 +21,39 @@ jobs:
           echo Runner OS: %RUNNER_OS%
           if exist "C:\msys64" (echo MSYS2 path exists: True) else (echo MSYS2 path exists: False)
 
+      - name: Prepare MSYS2 environment (MINGW64)
+        shell: cmd
+        run: |
+          echo BASH=C:\msys64\usr\bin\bash.exe>> "%GITHUB_ENV%"
+          echo MSYSTEM=MINGW64>> "%GITHUB_ENV%"
+          echo CHERE_INVOKING=1>> "%GITHUB_ENV%"
+
       - name: Select MSYS2 shell (mingw64 preferred)
         shell: cmd
         run: |
           if exist "C:\msys64\mingw64.exe" (set BASH=C:\msys64\mingw64.exe)
           if not exist "C:\msys64\mingw64.exe" (set BASH=C:\msys64\usr\bin\bash.exe)
-          echo BASH=%BASH%>> %GITHUB_ENV%
+          echo BASH=%BASH%>> "%GITHUB_ENV%"
 
       - name: Ensure E:\io exists
         shell: cmd
         run: |
           if not exist "E:\io" mkdir "E:\io"
 
+      - name: Tool versions
+        shell: cmd
+        run: |
+          "%BASH%" -lc "export PATH=/mingw64/bin:/usr/bin:$PATH; gcc --version; cmake --version; (ninja --version || true); (mingw32-make --version || true)"
+
       - name: Configure (MSYS2 MinGW64)
         shell: cmd
         run: |
-          "%BASH%" -lc "export PATH=/mingw64/bin:$PATH; BUILD_WIN='E:/io'; BUILD=$(cygpath -u \"$BUILD_WIN\"); cmake -S . -B \"$BUILD\" -G 'Ninja' -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} -DIO_BUILD_TESTS=OFF -DIO_BUILD_EXAMPLES=ON"
+          "%BASH%" -lc "export PATH=/mingw64/bin:/usr/bin:$PATH; BUILD_WIN='E:/io'; BUILD=$(cygpath -u \"$BUILD_WIN\"); if command -v ninja >/dev/null 2>&1; then GEN='Ninja'; else GEN='MinGW Makefiles'; fi; echo Using generator: $GEN; cmake -S . -B \"$BUILD\" -G \"$GEN\" -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} -DIO_BUILD_TESTS=OFF -DIO_BUILD_EXAMPLES=ON"
 
       - name: Build (MSYS2 MinGW64)
         shell: cmd
         run: |
-          "%BASH%" -lc "export PATH=/mingw64/bin:$PATH; BUILD_WIN='E:/io'; BUILD=$(cygpath -u \"$BUILD_WIN\"); cmake --build \"$BUILD\" -j"
+          "%BASH%" -lc "export PATH=/mingw64/bin:/usr/bin:$PATH; BUILD_WIN='E:/io'; BUILD=$(cygpath -u \"$BUILD_WIN\"); cmake --build \"$BUILD\" -j"
 
       - name: List build outputs
         shell: cmd
