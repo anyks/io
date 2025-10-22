@@ -188,7 +188,7 @@ TEST(NetHighload, ManyClientsEchoNoBlock) {
 				if (!ok) {
 					attempts++;
 					// Backoff slightly to give kernel time to allocate an ephemeral port
-					std::this_thread::sleep_for(5ms);
+					if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 					// Only recreate the socket occasionally; otherwise retry on the same fd
 					if (attempts % 5 == 0) {
 						// Try to recover: remove and recreate the socket, update mappings.
@@ -225,7 +225,7 @@ TEST(NetHighload, ManyClientsEchoNoBlock) {
 					while (std::chrono::steady_clock::now() < wait_until &&
 						   !clients[i].connected.load(std::memory_order_relaxed) &&
 						   !clients[i].closed.load(std::memory_order_relaxed)) {
-						std::this_thread::sleep_for(2ms);
+						if (!engine->loop_once(2)) std::this_thread::sleep_for(2ms);
 					}
 					if (!clients[i].connected.load(std::memory_order_relaxed)) {
 						// Treat as failed attempt if it closed or still not connected
@@ -245,7 +245,7 @@ TEST(NetHighload, ManyClientsEchoNoBlock) {
 				FAIL() << "Timeout waiting for clients to connect: " << connected_clients.load() << "/" << N;
 				break;
 			}
-			std::this_thread::sleep_for(5ms);
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 		}
 
 		// Flood a lot of user events (to test post path under pressure)
@@ -265,7 +265,7 @@ TEST(NetHighload, ManyClientsEchoNoBlock) {
 							  << ", user_count=" << user_count.load() << "/" << M;
 				break;
 			}
-			std::this_thread::sleep_for(5ms);
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 		}
 
 		EXPECT_EQ(echoed_clients.load(), N);
@@ -279,7 +279,12 @@ TEST(NetHighload, ManyClientsEchoNoBlock) {
 			engine->delete_socket(clients[i].fd);
 		for (int i = 0; i < N; ++i)
 			engine->disconnect(clients[i].fd);
-		std::this_thread::sleep_for(50ms);
+		{
+			auto until = std::chrono::steady_clock::now() + 50ms;
+			while (std::chrono::steady_clock::now() < until) {
+				if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
+			}
+		}
 		::close(listen_fd);
 		engine->destroy();
 

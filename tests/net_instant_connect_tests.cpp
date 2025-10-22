@@ -96,7 +96,7 @@ TEST(NetInstantConnect, AddSocketBeforeConnect_BufferAndCallbackSurvive) {
 			FAIL() << "Timeout waiting for client/server connect";
 			break;
 		}
-		std::this_thread::sleep_for(10ms);
+		if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
 	}
 
 	// Ожидаем доставку на клиента

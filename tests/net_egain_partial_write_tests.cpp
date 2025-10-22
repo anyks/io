@@ -75,7 +75,7 @@ TEST(NetEagain, PartialWriteThenDrain) {
       FAIL() << "timeout waiting for accept";
       break;
     }
-    std::this_thread::sleep_for(2ms);
+    if (!engine->loop_once(2)) std::this_thread::sleep_for(2ms);
   }
 
   // Queue a large payload on the client to likely saturate send buffers
@@ -84,7 +84,12 @@ TEST(NetEagain, PartialWriteThenDrain) {
   ASSERT_TRUE(engine->write(cfd, payload.data(), payload.size()));
 
   // Give the loop some time to push until EAGAIN; server is not yet reading
-  std::this_thread::sleep_for(50ms);
+  {
+    auto until = std::chrono::steady_clock::now() + 50ms;
+    while (std::chrono::steady_clock::now() < until) {
+      if (!engine->loop_once(2)) std::this_thread::sleep_for(2ms);
+    }
+  }
 
   // Now start reading on the server and count bytes
   io::socket_t sfd = srv_client.load(std::memory_order_acquire);
@@ -99,7 +104,7 @@ TEST(NetEagain, PartialWriteThenDrain) {
   auto t1 = std::chrono::steady_clock::now();
   while (server_bytes.load() < total) {
     if (std::chrono::steady_clock::now() - t1 > 3s) break;
-    std::this_thread::sleep_for(2ms);
+    if (!engine->loop_once(2)) std::this_thread::sleep_for(2ms);
   }
   EXPECT_EQ(server_bytes.load(), total);
   // Ensure the client reported at least some physical writes

@@ -101,7 +101,7 @@ TEST(NetPauseMultiTimeout, MixedResumeAndTimeouts) {
 	while (server_accepts.load() < N) {
 		if (std::chrono::steady_clock::now() - tstart > 2s)
 			break;
-		std::this_thread::sleep_for(5ms);
+		if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 	}
 	ASSERT_GE(server_accepts.load(), N);
 
@@ -118,7 +118,12 @@ TEST(NetPauseMultiTimeout, MixedResumeAndTimeouts) {
 	}
 
 	// resume first half before timeout
-	std::this_thread::sleep_for(100ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 100ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
+		}
+	}
 	for (int i = 0; i < N / 2; ++i) {
 		ASSERT_TRUE(engine->resume_read(client_fds[i]));
 	}
@@ -134,15 +139,25 @@ TEST(NetPauseMultiTimeout, MixedResumeAndTimeouts) {
 			break;
 		if (std::chrono::steady_clock::now() - t0 > 2s)
 			break;
-		std::this_thread::sleep_for(5ms);
+		if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 	}
 	for (int i = 0; i < N / 2; ++i)
 		EXPECT_EQ(delivered[i].load(), (int)payload.size());
 
 	// give time to fire timeouts for second half
-	std::this_thread::sleep_for(400ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 400ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
+		}
+	}
 	int before = closes.load();
-	std::this_thread::sleep_for(100ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 100ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
+		}
+	}
 	EXPECT_GE(closes.load(), before); // at least some closes should have fired due to timeout
 
 	// cleanup

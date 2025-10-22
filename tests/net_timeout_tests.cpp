@@ -70,7 +70,7 @@ TEST(NetTimeout, ReadIdleCloseClient) {
 			FAIL() << "Timeout waiting for server accept";
 			break;
 		}
-		std::this_thread::sleep_for(10ms);
+		if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
 	}
 
 	// Register server side buffer but don't send any data; set timeout 100ms
@@ -83,7 +83,7 @@ TEST(NetTimeout, ReadIdleCloseClient) {
 	while (close_count.load() == 0) {
 		if (std::chrono::steady_clock::now() - start > 2s)
 			break;
-		std::this_thread::sleep_for(10ms);
+		if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
 	}
 	EXPECT_GE(close_count.load(), 1);
 
@@ -141,7 +141,7 @@ TEST(NetTimeout, DisableTimeout) {
 			FAIL() << "Timeout waiting for server accept";
 			break;
 		}
-		std::this_thread::sleep_for(10ms);
+		if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
 	}
 
 	io::socket_t srvfd = server_client_fd.load(std::memory_order_acquire);
@@ -153,7 +153,12 @@ TEST(NetTimeout, DisableTimeout) {
 	// Ensure no close within 500ms
 	std::atomic<int> close_count{0};
 	cbs.on_close = [&](io::socket_t) { close_count++; };
-	std::this_thread::sleep_for(600ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 600ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
+		}
+	}
 	EXPECT_EQ(close_count.load(), 0);
 
 	::close(listen_fd);

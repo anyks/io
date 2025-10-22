@@ -72,7 +72,7 @@ TEST(NetSigpipe, ClientWriteAfterServerClose) {
       FAIL() << "timeout waiting for accept";
       break;
     }
-    std::this_thread::sleep_for(5ms);
+    if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
   }
   io::socket_t sfd = srv_client.load(std::memory_order_acquire);
   ASSERT_NE(sfd, io::kInvalidSocket);
@@ -88,7 +88,7 @@ TEST(NetSigpipe, ClientWriteAfterServerClose) {
   auto t1 = std::chrono::steady_clock::now();
   while (close_count.load() == 0) {
     if (std::chrono::steady_clock::now() - t1 > 1s) break;
-    std::this_thread::sleep_for(10ms);
+    if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
   }
   EXPECT_GE(close_count.load(), 1);
 
@@ -138,7 +138,7 @@ TEST(NetSigpipe, ServerWriteAfterClientClose) {
       FAIL() << "timeout waiting for accept";
       break;
     }
-    std::this_thread::sleep_for(5ms);
+    if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
   }
   ::shutdown(client_fd, SHUT_RDWR);
   ::close(client_fd);
@@ -154,7 +154,7 @@ TEST(NetSigpipe, ServerWriteAfterClientClose) {
   auto t2 = std::chrono::steady_clock::now();
   while (close_count.load() == 0) {
     if (std::chrono::steady_clock::now() - t2 > 1s) break;
-    std::this_thread::sleep_for(10ms);
+    if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
   }
   EXPECT_GE(close_count.load(), 1);
 

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <atomic>
 
 namespace io {
 
@@ -43,6 +44,41 @@ class INetEngine {
 
 	virtual bool init(const NetCallbacks &cbs) = 0;
 	virtual void destroy() = 0;
+
+	// Однократная обработка событий. Возвращает true, если было обработано
+	// хотя бы одно событие, иначе false. По умолчанию no-op, движки могут
+	// переопределить для inline-режима без внутренних потоков.
+	virtual bool loop_once(uint32_t /*timeout_ms*/) { return false; }
+
+	// Запустить цикл обработки событий в текущем потоке.
+	// wait_ms семантика:
+	//  < 0  — бесконечное ожидание (блокирующее);
+	//  == 0 — неблокирующий опрос (busy-poll);
+	//  > 0  — ожидание событий не более указанного числа миллисекунд.
+	// По умолчанию делегирует в event_loop(), который можно переопределить в бэкенде.
+	virtual void start(int32_t wait_ms = -1) {
+		loop_running_.store(true, std::memory_order_relaxed);
+		event_loop(loop_running_, wait_ms);
+	}
+
+	// Остановить цикл, запущенный start(). Безопасно вызывать из callback’ов.
+	// Вызывает wake() для немедленного пробуждения блокирующих ожиданий внутри event_loop().
+	virtual void stop() {
+		loop_running_.store(false, std::memory_order_relaxed);
+		wake();
+	}
+
+	// Новый универсальный цикл обработки событий. Бэкенд должен блокироваться
+	// на нативном ожидании (epoll_wait/kevent/io_uring_wait_cqe/GQCS и т.д.)
+	// и периодически проверять run_flag.load(). Значение wait_ms см. выше.
+	// Реализация по умолчанию совместима со старыми бэкендами через loop_once().
+	virtual void event_loop(std::atomic<bool> &run_flag, int32_t wait_ms) {
+		const uint32_t inf = 0xFFFFFFFFu;
+		const uint32_t tm = (wait_ms < 0) ? inf : static_cast<uint32_t>(wait_ms);
+		while (run_flag.load(std::memory_order_relaxed)) {
+			(void)loop_once(tm);
+		}
+	}
 
 	virtual bool add_socket(socket_t socket, char *buffer, size_t buffer_size, ReadCallback cb) = 0;
 	virtual bool delete_socket(socket_t socket) = 0;
@@ -87,6 +123,13 @@ class INetEngine {
 	// Авто-тюнинг глубины AcceptEx по темпам входящих соединений (только IOCP).
 	// Повторные вызовы обновляют конфигурацию. Если cfg.enabled=false — авто-тюнинг отключается.
 	virtual bool set_accept_autotune(socket_t listen_socket, const AcceptAutotuneConfig &cfg) = 0;
+protected:
+	// Флаг выполнения цикла start/stop по умолчанию.
+	std::atomic<bool> loop_running_{false};
+
+	// Метод пробуждения блокирующего ожидания внутри event_loop(). Бэкенды
+	// должны переопределить его (например, записью в eventfd/pipe, PostQueuedCompletionStatus, и т.п.).
+	virtual void wake() {}
 };
 
 // Фабрика выбирает реализацию в зависимости от ОС/движка

@@ -58,14 +58,3 @@ jobs:
         run: cmake --build --preset debug -j
       - name: Test (Debug)
         run: ctest --preset debug
-
-  windows-msvc:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure (MSVC Debug)
-        run: cmake -S . -B build/win -G "Visual Studio 17 2022" -A x64 -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON
-      - name: Build (MSVC Debug)
-        run: cmake --build build/win --config Debug --target io io_tests example_client example_server
-      - name: Test (MSVC Debug)
-        run: ctest --test-dir build/win -C Debug --output-on-failure

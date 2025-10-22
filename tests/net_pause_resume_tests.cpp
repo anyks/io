@@ -86,7 +86,7 @@ TEST(NetPauseResume, PauseSuppressesThenResumeDelivers) {
 	while (!(client_connected.load() && server_connected.load())) {
 		if (std::chrono::steady_clock::now() - start > 2s)
 			FAIL() << "Timeout waiting for connections";
-		std::this_thread::sleep_for(5ms);
+		if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 	}
 
 	// Pause reads on client socket before sending data
@@ -97,7 +97,12 @@ TEST(NetPauseResume, PauseSuppressesThenResumeDelivers) {
 	ASSERT_TRUE(engine->write(client_fd, payload.data(), payload.size()));
 
 	// Wait a bit to ensure echo would arrive if not paused
-	std::this_thread::sleep_for(100ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 100ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
+		}
+	}
 	EXPECT_EQ(client_reads.load(), 0) << "Client should not receive while paused";
 	EXPECT_EQ(delivered_bytes.load(), 0);
 
@@ -109,7 +114,7 @@ TEST(NetPauseResume, PauseSuppressesThenResumeDelivers) {
 	while (delivered_bytes.load() < (int)payload.size()) {
 		if (std::chrono::steady_clock::now() - t0 > 2s)
 			break;
-		std::this_thread::sleep_for(5ms);
+		if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 	}
 	EXPECT_EQ(delivered_bytes.load(), (int)payload.size());
 	EXPECT_GT(client_reads.load(), 0);

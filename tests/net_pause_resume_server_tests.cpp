@@ -81,13 +81,18 @@ TEST(NetPauseResumeServer, ServerPauseSuppressesThenResumeDelivers) {
 			FAIL() << "Timeout waiting for connections";
 			break;
 		}
-		std::this_thread::sleep_for(10ms);
+		if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
 	}
 
 	// Пока пауза активна на сервере, шлём данные клиентом
 	const std::string payload = std::string(1024, 'S');
 	ASSERT_TRUE(engine->write(client_fd, payload.data(), payload.size()));
-	std::this_thread::sleep_for(100ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 100ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
+		}
+	}
 	// Проверяем, что байты не доставлены на сервере
 	EXPECT_EQ(server_bytes.load(), 0);
 
@@ -100,7 +105,7 @@ TEST(NetPauseResumeServer, ServerPauseSuppressesThenResumeDelivers) {
 	while (server_bytes.load() < (int)payload.size()) {
 		if (std::chrono::steady_clock::now() - t0 > 2s)
 			break;
-		std::this_thread::sleep_for(5ms);
+		if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 	}
 	EXPECT_EQ(server_bytes.load(), (int)payload.size());
 

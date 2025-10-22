@@ -86,14 +86,14 @@ TEST(NetLimits, RandomChurnConnectDisconnect) {
 		bool connected = engine->connect(cfd, "127.0.0.1", port, true);
 		if (!connected) {
 			for (int r = 0; r < 3 && !connected; ++r) {
-				std::this_thread::sleep_for(1ms);
+				if (!engine->loop_once(1)) std::this_thread::sleep_for(1ms);
 				connected = engine->connect(cfd, "127.0.0.1", port, true);
 			}
 		}
 		ASSERT_TRUE(connected);
 		// short activity
 		engine->write(cfd, "a", 1);
-		std::this_thread::sleep_for(2ms);
+		if (!engine->loop_once(2)) std::this_thread::sleep_for(2ms);
 		engine->disconnect(cfd);
 		{
 			std::lock_guard<std::mutex> lk(client_mtx);
@@ -150,9 +150,16 @@ TEST(NetLimits, EnforceMaxConnections) {
 		char buf[256];
 		engine->add_socket(fd, buf, sizeof(buf), nullptr);
 		ASSERT_TRUE(engine->connect(fd, "127.0.0.1", port, true));
+		// Pump a little to progress async connect/accept
+		(void)engine->loop_once(1);
 		wave1.push_back(fd);
 	}
-	std::this_thread::sleep_for(100ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 100ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
+		}
+	}
 	EXPECT_EQ(server_accepts.load(), (int)maxC);
 
 	// Second wave: try to exceed limit
@@ -168,16 +175,27 @@ TEST(NetLimits, EnforceMaxConnections) {
 		char buf[256];
 		engine->add_socket(fd, buf, sizeof(buf), nullptr);
 		engine->connect(fd, "127.0.0.1", port, true);
+		(void)engine->loop_once(1);
 		wave2.push_back(fd);
 	}
-	std::this_thread::sleep_for(100ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 100ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
+		}
+	}
 	// Limit should keep accepts at maxC while first wave is connected
 	EXPECT_EQ(server_accepts.load(), (int)maxC);
 
 	// Cleanup wave1 and allow wave2 to fill in up to maxC
 	for (io::socket_t fd : wave1)
 		engine->disconnect(fd);
-	std::this_thread::sleep_for(150ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 150ms;
+		while (std::chrono::steady_clock::now() < until) {
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
+		}
+	}
 	// server_accepts should be between maxC and 2*maxC depending on timing
 	EXPECT_LE(server_accepts.load(), (int)(2 * maxC));
 	EXPECT_GE(server_accepts.load(), (int)maxC);

@@ -54,6 +54,7 @@ TEST(NetIntegration, ClientServerEchoAndPost) {
 
 	io::NetCallbacks cbs{};
 	cbs.on_accept = [&](io::socket_t fd) {
+		std::fprintf(stderr, "[test] on_accept fd=%d client_fd=%d listen_fd=%d\n", (int)fd, (int)client_fd, (int)listen_fd);
 		if (fd == client_fd) {
 			client_connected = true;
 		} else if (fd != listen_fd) {
@@ -98,13 +99,25 @@ TEST(NetIntegration, ClientServerEchoAndPost) {
 			FAIL() << "Timeout waiting for connections";
 			break;
 		}
-		std::this_thread::sleep_for(10ms);
+		// Обслужим события inline, если движок поддерживает
+		if (!engine->loop_once(10)) {
+			std::this_thread::sleep_for(10ms);
+		}
 	}
 
 	// send echo
 	const char *msg = "hello";
 	ASSERT_TRUE(engine->write(client_fd, msg, std::strlen(msg)));
-	ASSERT_EQ(echo_future.wait_for(2s), std::future_status::ready);
+	// Pump the loop while waiting for echo
+	{
+		auto until = std::chrono::steady_clock::now() + 2s;
+		while (std::chrono::steady_clock::now() < until) {
+			if (echo_future.wait_for(0ms) == std::future_status::ready)
+				break;
+			if (!engine->loop_once(10)) std::this_thread::sleep_for(10ms);
+		}
+	}
+	ASSERT_EQ(echo_future.wait_for(0ms), std::future_status::ready);
 
 	// user events
 	for (uint32_t i = 1; i <= 5; i++)
@@ -120,7 +133,9 @@ TEST(NetIntegration, ClientServerEchoAndPost) {
 			break;
 		if (std::chrono::steady_clock::now() - start2 > 2s)
 			break;
-		std::this_thread::sleep_for(10ms);
+		if (!engine->loop_once(10)) {
+			std::this_thread::sleep_for(10ms);
+		}
 	}
 	{
 		std::lock_guard<std::mutex> lk(*user_mtx);

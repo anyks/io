@@ -90,7 +90,7 @@ struct TestRig {
 		while (!(client_connected.load() && server_connected.load())) {
 			if (std::chrono::steady_clock::now() - start > 2s)
 				return false;
-			std::this_thread::sleep_for(5ms);
+			if (!engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 		}
 		return true;
 	}
@@ -120,7 +120,12 @@ TEST(NetTimeoutPause, ResumeBeforeTimeout_NoClose) {
 	std::string payload(256, 'B');
 	ASSERT_TRUE(rig.engine->write(rig.client_fd, payload.data(), payload.size()));
 
-	std::this_thread::sleep_for(100ms); // still within timeout window
+	{
+		auto until = std::chrono::steady_clock::now() + 100ms; // still within timeout window
+		while (std::chrono::steady_clock::now() < until) {
+			if (!rig.engine->loop_once(5)) std::this_thread::sleep_for(5ms);
+		}
+	}
 	ASSERT_TRUE(rig.engine->resume_read(rig.client_fd));
 
 	// Expect data delivered and no close due to timeout
@@ -128,7 +133,7 @@ TEST(NetTimeoutPause, ResumeBeforeTimeout_NoClose) {
 	while (rig.client_reads.load() < (int)payload.size()) {
 		if (std::chrono::steady_clock::now() - t0 > 2s)
 			break;
-		std::this_thread::sleep_for(5ms);
+		if (!rig.engine->loop_once(5)) std::this_thread::sleep_for(5ms);
 	}
 	EXPECT_EQ(rig.closes.load(), 0);
 	EXPECT_EQ(rig.client_reads.load(), (int)payload.size());
@@ -147,10 +152,12 @@ TEST(NetTimeoutPause, ExceedTimeoutWhilePaused_CloseFires) {
 	ASSERT_TRUE(rig.engine->pause_read(rig.client_fd));
 
 	// Wait beyond timeout; engine should close the socket due to idle timeout
-	std::this_thread::sleep_for(400ms);
-
-	// Give event loop a tick to process timer
-	std::this_thread::sleep_for(50ms);
+	{
+		auto until = std::chrono::steady_clock::now() + 450ms; // allow timeout and processing
+		while (std::chrono::steady_clock::now() < until) {
+			if (!rig.engine->loop_once(10)) std::this_thread::sleep_for(10ms);
+		}
+	}
 
 	EXPECT_GE(rig.closes.load(), 1);
 

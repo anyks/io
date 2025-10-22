@@ -125,7 +125,31 @@ cmake --install build/release --prefix ./_install
 - В Debug-сборке включены диагностические логи (отключаются с NDEBUG).
 - Во всех бэкендах логируется завершение connect (результат getsockopt(SO_ERROR) или эквивалент), что помогает при отладке сетевых флапов.
 
-Включение расширенного логирования
+Расширенное логирование kqueue (macOS/*BSD)
+- Доступна дополнительная детализация событий kqueue (EVFILT_READ/WRITE/TIMER/USER) через флаг сборки `IO_ENABLE_KQUEUE_VERBOSE`.
+- По умолчанию флаг выключен (OFF), чтобы не засорять stderr.
+- Включение:
+	```bash
+	# Вариант A: отдельный build-каталог
+	cmake -S . -B build/debug-verbose -DIO_ENABLE_KQUEUE_VERBOSE=ON -DCMAKE_BUILD_TYPE=Debug
+	cmake --build build/debug-verbose -j
+	ctest --test-dir build/debug-verbose --output-on-failure
+
+	# Вариант B: через пресет debug с добавлением опции
+	cmake --preset debug -DIO_ENABLE_KQUEUE_VERBOSE=ON
+	cmake --build --preset debug -j
+	ctest --preset debug --output-on-failure
+	```
+- Где смотреть логи:
+	- Стандартный поток ошибок (stderr) во время запуска примеров/тестов.
+	- Префиксы строк: `[io/kqueue][DBG]` — отладочные события, `[io/kqueue][ERR]` — ошибки (активны в Debug).
+- Что логируется дополнительно при `IO_ENABLE_KQUEUE_VERBOSE=ON`:
+	- Количество событий за итерацию `loop_once`.
+	- Поля kevent: `fd`, `filter`, `flags`, `fflags`, `data`.
+	- Этапы завершения `connect` с `SO_ERROR`.
+	- Принятие соединений (`accept: client fd=...`).
+
+Включение расширенного логирования (общие рекомендации)
 - По умолчанию логи активны в Debug-профиле:
 	```bash
 	cmake --preset debug
@@ -278,6 +302,56 @@ ctest --test-dir ./build/tsan -R NetHighload.ManyClientsEchoNoBlock --repeat-unt
 	cmake --build --preset ubsan && ctest --preset ubsan
 	```
 
+## Диагностика других бэкендов (Linux/Windows/Solaris)
+
+Ниже — практические подсказки по включению и интерпретации диагностики для остальных бэкендов. По умолчанию в Debug уже логируется завершение `connect` (через `SO_ERROR` или эквивалент). Для глубокой трассировки рекомендуется временно добавить `IO_LOG_DBG` в соответствующие места реализации.
+
+### epoll (Linux)
+- Где смотреть: `src/net_epoll.cpp`.
+- Что полезно логировать дополнительно:
+	- Результат `epoll_wait`: число событий за итерацию цикла.
+	- По каждому событию: `fd`, маска (`EPOLLIN`/`EPOLLOUT`/`EPOLLERR`/`EPOLLHUP`), размеры очередей на запись.
+	- Завершение `connect`: `getsockopt(SO_ERROR)` (уже логируется в Debug), переход к подписке на `EPOLLIN`.
+	- Принятие соединений (`accept`) — `client fd` и перевод в неблокирующий режим.
+- Советы:
+	- Для тестов без фоновых потоков обязательно «помпите» цикл через `loop_once()` во время ожиданий (см. тесты `Net*`).
+	- Для поиска горячих мест включите ASan/TSan: `--preset asan/tsan`.
+
+### io_uring (Linux)
+- Где смотреть: `src/net_iouring.cpp`.
+- Что полезно логировать:
+	- Отправка и завершение операций: SQE/CQE (поля `user_data`, `res`, `flags`).
+	- `connect/accept/read/write` — постановка и завершение, размеры буферов, ошибки.
+- Особенности:
+	- Если `liburing` недоступна, CMake автоматически откатится на epoll (будет сообщение при конфигурации).
+	- При отладке важно связать `user_data` с конкретным `fd`/операцией.
+
+### IOCP (Windows)
+- Где смотреть: `src/net_iocp.cpp`.
+- Что полезно логировать:
+	- Комлиты завершений: код статуса, число переданных байт, тип операции.
+	- Ошибки Winsock: `WSAGetLastError()` и расшифровка.
+	- Завершение `AcceptEx`/`ConnectEx` и последующая подписка на чтение.
+- Полезные опции:
+	- `-DIO_IOCP_ACCEPT_DEPTH=N` — целевая параллельная глубина AcceptEx (по умолчанию 4).
+
+### Event Ports и /dev/poll (Solaris)
+- Где смотреть: `src/net_eventports.cpp` и `src/net_devpoll.cpp`.
+- Общая архитектура: один поток, `loop_once()` с таймаутом ближайшего idle‑дедлайна; переассоциация `fd` после обработки (one‑shot).
+- Event Ports:
+	- Ожидание: `port_getn(timeout_ms)`; пользовательские события через `port_send()`.
+	- Логирование при `-DIO_ENABLE_EVENTPORTS_VERBOSE=ON`: количество событий, `portev_source/events/object`.
+- /dev/poll (fallback):
+	- Ожидание: `ioctl(DP_POLL)` с `dp_timeout`, равным ближайшему дедлайну.
+	- Пользовательские события через внутреннюю трубу; логирование при `-DIO_ENABLE_DEVPOLL_VERBOSE=ON`.
+
+### Общий чек‑лист отладки
+- Убедитесь, что `add_socket()` вызывается до `connect()` — это гарантирует корректную доставку `on_read` после установления соединения.
+- В тестах без фонового `event_loop()` используйте циклы с `loop_once()` вместо `sleep()` во время ожиданий.
+- `set_read_timeout(fd, ms)` — это idle‑таймер: он переармируется после каждого успешного чтения.
+- `pause_read()/resume_read()` должны сопровождаться включением/выключением интереса к чтению у конкретного бэкенда (kqueue: EV_ENABLE/EV_DISABLE; epoll: модификация интересов).
+- При `EPIPE/ECONNRESET` в `send()` запись прекращается: счётчик broken‑pipe доступен через `io::broken_pipe_count()`.
+
 ## Заметки для Windows (IOCP)
 
 - Бэкенд: IOCP (I/O Completion Ports). Тип сокета `socket_t` равен `SOCKET`. Фабрика `create_engine()` выберет IOCP автоматически.
@@ -296,21 +370,20 @@ ctest --test-dir ./build/tsan -R NetHighload.ManyClientsEchoNoBlock --repeat-unt
 
 ## Заметки для Solaris (event ports/devpoll)
 
-- По умолчанию используется Event Ports (`IO_WITH_EVENTPORTS=ON`). При недоступности можно переключиться на `/dev/poll`: `-DIO_WITH_EVENTPORTS=OFF`.
+- По умолчанию используется Event Ports (`IO_WITH_EVENTPORTS=ON`). Переключение на `/dev/poll`: `-DIO_WITH_EVENTPORTS=OFF`.
 - Сборка (SunOS):
 	```bash
 	cmake -S . -B build/sol -DCMAKE_BUILD_TYPE=Debug -DIO_WITH_EVENTPORTS=ON
 	cmake --build build/sol -j
 	ctest --test-dir build/sol --output-on-failure
 	```
-- Таймауты чтения:
-	- Event Ports: таймеры через `timer_create` + `SIGEV_PORT` (событие приходит в порт).
-	- /dev/poll: эмуляция через pipe и отдельный поток-таймер per-socket.
-- Логирование SO_ERROR при завершении connect включено в обоих бэкендах (Debug).
+- Idle‑таймауты чтения в обоих бэкендах реализованы без фоновых потоков: ближайший дедлайн превращается в таймаут вызова ожидания (`port_getn` или `DP_POLL`), после каждого цикла просроченные соединения закрываются.
+- Пользовательские события: Event Ports — `port_send()`; /dev/poll — внутренняя пользовательская труба.
+- Диагностическое логирование можно расширить флагами: `IO_ENABLE_EVENTPORTS_VERBOSE` и `IO_ENABLE_DEVPOLL_VERBOSE`.
 
 ### Запуск стресс‑сценариев на Solaris
 
-В репозитории есть готовые сценарии для удалённого запуска на Solaris‑хосте (настройки — `scripts/solaris/.env`).
+В репозитории есть готовые сценарии для удалённого запуска на Solaris‑хосте (настройки — `scripts/solaris/.env`). На GitHub Actions CI для Solaris намеренно не включён: используйте скрипты ниже для ручных (или cron) прогонов.
 
 ```bash
 # Синхронизировать проект на удалённый Solaris
@@ -350,7 +423,11 @@ bash scripts/solaris/solaris_parallel_and_stress.sh 4 200
 - Таймаут чтения (`set_read_timeout`) — idle-таймер: закрывает сокет, если за заданный период не пришло ни одного байта. Это не таймаут «всего запроса/ответа».
 - Backpressure на запись: `write` складывает данные в очередь и отправляет порциями по готовности. Большие bursts могут увеличивать задержки; контролируйте объёмы и проглатывайте подтверждения через on_write при необходимости.
 - Авто‑тюнинг AcceptEx доступен только для IOCP (Windows); на других бэкендах вызовы возвращают `true`, но не меняют поведение.
-- Solaris /dev/poll: таймеры чтения эмулируются через pipe и фоновые потоки per-socket; это влияет на масштабируемость при очень большом числе тайм-аутов.
+- Solaris /dev/poll: таймеры чтения реализованы без фоновых потоков — через ближайший дедлайн и `DP_POLL` таймаут; поведение согласовано с Event Ports.
+
+### Дополнительно о Solaris
+
+Подробности архитектуры и диагностики см. в `docs/solaris.md`.
 - Логирование: диагностические логи (включая SO_ERROR при завершении connect) активны только в Debug‑сборках; для Release см. раздел «Включение расширенного логирования».
 
 ## Релиз (tag → артефакты)

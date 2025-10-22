@@ -1,6 +1,6 @@
 # IO — portable project context
 
-Date: 2025-10-21
+Date: 2025-10-23
 Branch: main
 
 This document captures the working context so the assistant on another machine (e.g., Linux) can load the essentials without re-deriving history. It summarizes architecture, recent changes, build/test steps, style, and next actions.
@@ -140,35 +140,29 @@ Notes
 - Event Ports backend is enabled with `-DIO_WITH_EVENTPORTS=ON` (default). `/dev/poll` fallback with `OFF`.
 - If tests fail, grab failing output and share. For event ports timing issues, also check system logs.
 
-## Solaris timing: event ports, timers, and port_getn behavior
+## Solaris timing: Event Ports and /dev/poll (unified, threadless)
 
 Context
-- Initial attempt to use kernel timers with SIGEV_PORT (timer_create/timer_settime) failed with EPERM under non-privileged users on Solaris/Illumos.
-- To avoid privilege requirements and flakiness, we implemented software timers integrated with the event-loop via a user pipe.
+- We no longer rely on kernel timers with SIGEV_PORT nor on helper timer threads. Both Solaris backends implement idle read timeouts by converting the nearest per-socket deadline into the blocking wait timeout (`port_getn` for Event Ports, `DP_POLL` for /dev/poll).
 
 Implementation
-- A dedicated timer thread tracks per-socket deadlines (std::chrono) and wakes at the nearest deadline.
-- On expiry, the thread writes a small notification into the event-loop's user pipe to wake the loop; expired FDs are processed in the main loop.
-- Data structures: a map of socket -> {timeout_ms, deadline, active}; guarded by a mutex and condition_variable.
-- Rearm semantics: deadlines refresh on successful reads; when reads are paused (pause_read), timers are suspended; on resume_read, timers continue and can expire if the remaining time elapses.
-- File reference: `src/net_eventports.cpp` (look for `timer_loop`, `timers_`, and user-pipe handling).
+- Data structures: a map of socket -> {timeout_ms, deadline, active} managed in the main thread.
+- Each successful read re-arms the deadline. Paused sockets don't expire; on resume, deadlines continue.
+- `loop_once(now)` computes `next_timeout_ms(now)` as the minimum positive (remaining) deadline across active sockets and passes it to the wait primitive.
+- After handling events, `close_expired(now)` closes any sockets whose deadlines have passed and invokes `on_close`.
+- User events: Event Ports use `port_send(PORT_SOURCE_USER)`; /dev/poll uses an internal user pipe.
 
-port_getn
-- We use blocking `port_getn` (passing nullptr timeout). Spurious ETIME returns previously caused flaky timeouts; treating ETIME like EINTR (ignored) stabilized the loop.
+port_getn and ETIME
+- `port_getn` may return ETIME when the timeout elapses without events; treat it like "no events" (similar to EINTR handling). This is expected and not an error.
 
 Behavior and guarantees
-- Per-socket read timeouts: idle sockets close after timeout_ms without reads; any read activity resets the deadline.
-- Pause/Resume: while paused, a socket won't be closed by the timeout; resuming re-enables the countdown from the remaining budget.
-- User events and accept/read/write readiness continue to work unaffected; listener and user-pipe are re-armed appropriately on each loop.
-
-Trade-offs
-- No special privileges required; consistent behavior across systems.
-- Minor jitter may occur (sub-few-milliseconds) due to thread wake-ups and scheduling; validated as acceptable by tests.
+- Per-socket idle read timeouts behave consistently across backends.
+- Pause/Resume semantics match other platforms.
+- User events are FIFO and don't starve I/O events.
 
 Validation status (Solaris)
-- Full suite passing: 13/13 tests PASS.
-- Representative timings: NetTimeout.ReadIdleCloseClient ~113 ms, NetTimeout.DisableTimeout ~612 ms, NetPauseResume.* ~112 ms.
-- Run via: `scripts/solaris/solaris_test.sh` (stores logs in `build/sol/ctest_last.log`).
+- Full suite passing (both backends).
+- Highload stress: sequential 300 iterations PASS (remote scripts in `scripts/solaris/`).
 
 Related scripts
 - `scripts/solaris/solaris_sync.sh`, `solaris_configure.sh`, `solaris_build.sh`, `solaris_test.sh` — end-to-end loop for remote Solaris.

@@ -7,22 +7,25 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
-#include <mutex>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/devpoll.h>
 #include <sys/socket.h>
-#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+// Logging: errors in Debug, debug gated by IO_ENABLE_DEVPOLL_VERBOSE
 #ifndef NDEBUG
 #define IO_LOG_ERR(fmt, ...) std::fprintf(stderr, "[io/devpoll][ERR] " fmt "\n", ##__VA_ARGS__)
-#define IO_LOG_DBG(fmt, ...) std::fprintf(stderr, "[io/devpoll][DBG] " fmt "\n", ##__VA_ARGS__)
 #else
 #define IO_LOG_ERR(fmt, ...) ((void)0)
+#endif
+
+#ifdef IO_ENABLE_DEVPOLL_VERBOSE
+#define IO_LOG_DBG(fmt, ...) std::fprintf(stderr, "[io/devpoll][DBG] " fmt "\n", ##__VA_ARGS__)
+#else
 #define IO_LOG_DBG(fmt, ...) ((void)0)
 #endif
 
@@ -50,41 +53,23 @@ class DevPollEngine : public INetEngine {
 			fcntl(user_pipe_[1], F_SETFL, f1 | O_NONBLOCK);
 			add_poll(user_pipe_[0], POLLIN);
 		}
-		running_ = true;
-		loop_ = std::thread(&DevPollEngine::event_loop, this);
 		return true;
 	}
 	void destroy() override {
 		if (dpfd_ != -1) {
-			running_ = false;
-			if (user_pipe_[1] != -1) {
-				uint32_t v = 0;
-				(void)::write(user_pipe_[1], &v, sizeof(v));
-			}
-			if (loop_.joinable())
-				loop_.join();
 			// Cleanup all tracked sockets and timers
-			{
-				std::lock_guard<std::mutex> lk(mtx_);
-				for (auto &kv : sockets_) {
-					int fd = (int)kv.first;
-					rem_poll(fd);
-					if (cbs_.on_close)
-						cbs_.on_close(kv.first);
-					::shutdown(fd, SHUT_RDWR);
-					::close(fd);
-				}
-				for (auto &tkv : timers_) {
-					int tfd = tkv.second;
-					rem_poll(tfd);
-					::close(tfd);
-				}
-				sockets_.clear();
-				timers_.clear();
-				timer_targets_.clear();
-				listeners_.clear();
-				timeouts_ms_.clear();
+			for (auto &kv : sockets_) {
+				int fd = (int)kv.first;
+				rem_poll(fd);
+				if (cbs_.on_close)
+					cbs_.on_close(kv.first);
+				::shutdown(fd, SHUT_RDWR);
+				::close(fd);
 			}
+			sockets_.clear();
+			timers_.clear();
+			listeners_.clear();
+			timeouts_ms_.clear();
 			if (user_pipe_[0] != -1)
 				::close(user_pipe_[0]);
 			if (user_pipe_[1] != -1)
@@ -98,21 +83,13 @@ class DevPollEngine : public INetEngine {
 		if (flags < 0)
 			flags = 0;
 		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-		{
-			std::lock_guard<std::mutex> lk(mtx_);
-			sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false, false};
-		}
+		sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false, false};
 		add_poll(fd, POLLIN | POLLRDNORM | POLLHUP);
 		return true;
 	}
 	bool delete_socket(socket_t fd) override {
 		rem_poll(fd);
-		std::lock_guard<std::mutex> lk(mtx_);
-		auto it = timers_.find(fd);
-		if (it != timers_.end()) {
-			::close(it->second);
-			timers_.erase(it);
-		}
+		timers_.erase(fd);
 		sockets_.erase(fd);
 		timeouts_ms_.erase(fd);
 		return true;
@@ -144,7 +121,6 @@ class DevPollEngine : public INetEngine {
 		}
 		if (async && (err == EINPROGRESS)) {
 			add_poll(fd, POLLOUT | POLLIN | POLLRDNORM | POLLHUP);
-			std::lock_guard<std::mutex> lk(mtx_);
 			sockets_[fd].connecting = true;
 			return true;
 		}
@@ -167,15 +143,11 @@ class DevPollEngine : public INetEngine {
 			fcntl(listen_socket, F_SETFL, flags | O_NONBLOCK);
 		}
 		max_conn_ = max_connections;
-		{
-			std::lock_guard<std::mutex> lk(mtx_);
-			listeners_.insert(listen_socket);
-		}
+		listeners_.insert(listen_socket);
 		add_poll(listen_socket, POLLIN);
 		return true;
 	}
 	bool write(socket_t fd, const char *data, size_t data_size) override {
-		std::lock_guard<std::mutex> lk(mtx_);
 		auto it = sockets_.find(fd);
 		if (it == sockets_.end())
 			return false;
@@ -188,7 +160,6 @@ class DevPollEngine : public INetEngine {
 		return true;
 	}
 	bool pause_read(socket_t socket) override {
-		std::lock_guard<std::mutex> lk(mtx_);
 		auto it = sockets_.find(socket);
 		if (it == sockets_.end())
 			return false;
@@ -200,7 +171,6 @@ class DevPollEngine : public INetEngine {
 		return true;
 	}
 	bool resume_read(socket_t socket) override {
-		std::lock_guard<std::mutex> lk(mtx_);
 		auto it = sockets_.find(socket);
 		if (it == sockets_.end())
 			return false;
@@ -226,47 +196,22 @@ class DevPollEngine : public INetEngine {
 		return true;
 	}
 	bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
-		// /dev/poll не умеет таймеры; эмулируем через pipe и отдельный поток, как и в event ports выше
+		// Track logical timer; use DP_POLL timeout to drive expirations
 		if (timeout_ms == 0) {
-			std::lock_guard<std::mutex> lk(mtx_);
-			auto it = timers_.find(socket);
-			if (it != timers_.end()) {
-				rem_poll(it->second);
-				::close(it->second);
-				timers_.erase(it);
-			}
+			timers_.erase(socket);
 			timeouts_ms_.erase(socket);
 			return true;
 		}
-		{
-			std::lock_guard<std::mutex> lk(mtx_);
-			if (sockets_.find(socket) == sockets_.end())
-				return false;
-		}
-		int pfd[2]{-1, -1};
-		if (pipe(pfd) != 0)
+		if (sockets_.find(socket) == sockets_.end())
 			return false;
-		int f0 = fcntl(pfd[0], F_GETFL, 0);
-		fcntl(pfd[0], F_SETFL, f0 | O_NONBLOCK);
 		{
-			std::lock_guard<std::mutex> lk(mtx_);
-			auto it = timers_.find(socket);
-			if (it != timers_.end()) {
-				rem_poll(it->second);
-				::close(it->second);
-				timers_.erase(it);
-			}
-			timers_[socket] = pfd[0];
+			TimerInfo ti{};
+			ti.ms = timeout_ms;
+			ti.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+			ti.active = true;
+			timers_[socket] = ti;
 			timeouts_ms_[socket] = timeout_ms;
-			timer_targets_[pfd[0]] = socket;
-			add_poll(pfd[0], POLLIN);
 		}
-		std::thread([this, pd = pfd[1], timeout_ms]() {
-			::usleep(timeout_ms * 1000);
-			uint64_t one = 1;
-			(void)::write(pd, &one, sizeof(one));
-			::close(pd);
-		}).detach();
 		return true;
 	}
 
@@ -276,24 +221,39 @@ class DevPollEngine : public INetEngine {
 		size_t buf_size{0};
 		ReadCallback read_cb;
 		std::vector<char> out_queue;
-		bool want_write{false};
-		bool connecting{false};
-		bool paused{false};
+		std::atomic<bool> want_write{false};
+		std::atomic<bool> connecting{false};
+		std::atomic<bool> paused{false};
 	};
+	struct TimerInfo { uint32_t ms{0}; std::chrono::steady_clock::time_point deadline{}; bool active{false}; };
 	int dpfd_{-1};
 	NetCallbacks cbs_{};
-	std::thread loop_{};
-	std::atomic<bool> running_{false};
 	int user_pipe_[2]{-1, -1};
-	std::mutex mtx_;
 	std::unordered_map<socket_t, SockState> sockets_;
 	std::unordered_set<socket_t> listeners_;
 	std::unordered_map<socket_t, uint32_t> timeouts_ms_;
-	std::unordered_map<socket_t, int> timers_;
-	std::unordered_map<int, socket_t> timer_targets_;
+	std::unordered_map<socket_t, TimerInfo> timers_;
 	std::atomic<uint32_t> max_conn_{0};
 	std::atomic<uint32_t> cur_conn_{0};
 
+	int compute_next_timeout_ms(std::chrono::steady_clock::time_point now) {
+		bool has_any=false; auto next = now + std::chrono::hours(24);
+		for (auto &kv : timers_) { if (!kv.second.active) continue; has_any=true; if (kv.second.deadline < next) next = kv.second.deadline; }
+		if (!has_any) return 200; // default poll period
+		auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(next - now).count();
+		return ms < 0 ? 0 : (int)ms;
+	}
+	void close_expired(std::chrono::steady_clock::time_point now) {
+		std::vector<socket_t> expired;
+		for (auto &kv : timers_) { if (kv.second.active && kv.second.deadline <= now) { expired.push_back(kv.first); kv.second.active=false; } }
+		for (auto sfd : expired) {
+			rem_poll((int)sfd);
+			if (cbs_.on_close) cbs_.on_close(sfd);
+			::shutdown((int)sfd, SHUT_RDWR); ::close((int)sfd);
+			sockets_.erase(sfd); timers_.erase(sfd); timeouts_ms_.erase(sfd);
+			if (cur_conn_>0) cur_conn_--;
+		}
+	}
 	void add_poll(int fd, short events) {
 		struct pollfd p{};
 		p.fd = fd;
@@ -315,22 +275,15 @@ class DevPollEngine : public INetEngine {
 		}
 	}
 
-	void event_loop() {
-		while (running_) {
-			dvpoll dv{};
-			pollfd evs[1024];
-			dv.dp_fds = evs;
-			dv.dp_nfds = 1024;
-			dv.dp_timeout = 200;
-			int n = ::ioctl(dpfd_, DP_POLL, &dv);
-			if (n < 0) {
-				if (errno == EINTR)
-					continue;
-				IO_LOG_ERR("ioctl(DP_POLL) failed errno=%d (%s)", errno, std::strerror(errno));
-				continue;
-			}
-			if (n == 0)
-				continue;
+	bool loop_once(uint32_t timeout_ms) override {
+		if (dpfd_ < 0) return false;
+		dvpoll dv{}; pollfd evs[1024]; dv.dp_fds = evs; dv.dp_nfds = 1024;
+		auto now = std::chrono::steady_clock::now();
+		int base_to = (timeout_ms == 0xFFFFFFFFu) ? compute_next_timeout_ms(now) : (int)timeout_ms;
+		dv.dp_timeout = base_to;
+		int n = ::ioctl(dpfd_, DP_POLL, &dv);
+		if (n < 0) { if (errno == EINTR) { close_expired(std::chrono::steady_clock::now()); return false; } IO_LOG_ERR("ioctl(DP_POLL) failed errno=%d (%s)", errno, std::strerror(errno)); close_expired(std::chrono::steady_clock::now()); return false; }
+		if (n == 0) { close_expired(std::chrono::steady_clock::now()); return false; }
 			for (int i = 0; i < n; ++i) {
 				int fd = evs[i].fd;
 				short re = evs[i].revents;
@@ -342,37 +295,8 @@ class DevPollEngine : public INetEngine {
 					}
 					continue;
 				}
-				if (timer_targets_.find(fd) != timer_targets_.end() && (re & POLLIN)) {
-					uint64_t one;
-					while (::read(fd, &one, sizeof(one)) == sizeof(one)) {
-					}
-					socket_t sfd = -1;
-					{
-						std::lock_guard<std::mutex> lk(mtx_);
-						sfd = timer_targets_[fd];
-						timer_targets_.erase(fd);
-						for (auto it = timers_.begin(); it != timers_.end(); ++it) {
-							if (it->second == fd) {
-								timers_.erase(it);
-								break;
-							}
-						}
-						timeouts_ms_.erase(sfd);
-					}
-					if (sfd != -1) {
-						if (cbs_.on_close)
-							cbs_.on_close(sfd);
-						::close(sfd);
-					}
-					rem_poll(fd);
-					::close(fd);
-					continue;
-				}
 				bool is_listener = false;
-				{
-					std::lock_guard<std::mutex> lk(mtx_);
-					is_listener = listeners_.find(fd) != listeners_.end();
-				}
+				is_listener = listeners_.find(fd) != listeners_.end();
 				if (is_listener && (re & POLLIN)) {
 					while (true) {
 						sockaddr_storage ss{};
@@ -397,11 +321,7 @@ class DevPollEngine : public INetEngine {
 						fcntl(client, F_SETFL, fl | O_NONBLOCK);
 						// Предрегистрация клиента в sockets_ с пустым буфером до add_socket
 						{
-							std::lock_guard<std::mutex> lk(mtx_);
-							SockState st{};
-							st.buf = nullptr;
-							st.buf_size = 0;
-							st.read_cb = ReadCallback{};
+							SockState st{}; st.buf=nullptr; st.buf_size=0; st.read_cb = ReadCallback{};
 							sockets_.emplace((socket_t)client, std::move(st));
 						}
 						cur_conn_++;
@@ -412,7 +332,6 @@ class DevPollEngine : public INetEngine {
 					continue;
 				}
 				if (re & POLLOUT) {
-					std::unique_lock<std::mutex> lk(mtx_);
 					auto it = sockets_.find(fd);
 					if (it != sockets_.end() && it->second.connecting) {
 						int err = 0;
@@ -426,33 +345,27 @@ class DevPollEngine : public INetEngine {
 						}
 						it->second.connecting = false;
 						if (err == 0) {
-							lk.unlock();
 							IO_LOG_DBG("connect: established fd=%d", fd);
 							if (cbs_.on_accept)
 								cbs_.on_accept(fd);
 							// drop POLLOUT, keep read interest
 							add_poll(fd, POLLIN | POLLHUP);
 						} else {
-							lk.unlock();
 							if (cbs_.on_close)
 								cbs_.on_close(fd);
 							::close(fd);
-							std::lock_guard<std::mutex> lk2(mtx_);
 							sockets_.erase(fd);
 							continue;
 						}
 					}
 				}
 				if (re & (POLLIN | POLLRDNORM)) {
-					std::unique_lock<std::mutex> lk(mtx_);
 					auto it = sockets_.find(fd);
 					if (it == sockets_.end()) {
-						lk.unlock();
 						continue;
 					}
 					auto st = it->second;
 					bool paused = st.paused;
-					lk.unlock();
 					if (paused)
 						continue;
 					if (!st.buf || st.buf_size == 0 || !st.read_cb)
@@ -460,36 +373,29 @@ class DevPollEngine : public INetEngine {
 					ssize_t rn = ::recv(fd, st.buf, st.buf_size, 0);
 					if (rn > 0) {
 						st.read_cb(fd, st.buf, (size_t)rn);
+						// Rearm timer deadline
+						auto itT = timers_.find(fd);
+						if (itT != timers_.end()) { uint32_t ms = itT->second.ms; itT->second.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms); itT->second.active = true; }
 					} else if (rn == 0 || (re & (POLLHUP | POLLERR))) {
 						// peer closed or error: remove from poll set and close fd
 						rem_poll(fd);
 						if (cbs_.on_close)
 							cbs_.on_close(fd);
 						::close(fd);
-						std::lock_guard<std::mutex> lk2(mtx_);
 						sockets_.erase(fd);
 						if (cur_conn_ > 0)
 							cur_conn_--;
-						auto itT = timers_.find(fd);
-						if (itT != timers_.end()) {
-							int tfd = itT->second;
-							rem_poll(tfd);
-							::close(tfd);
-							timers_.erase(itT);
-						}
+						timers_.erase(fd);
 						timeouts_ms_.erase(fd);
 					}
 				}
 				if (re & POLLOUT) {
-					std::unique_lock<std::mutex> lk(mtx_);
 					auto it = sockets_.find(fd);
 					if (it != sockets_.end() && !it->second.out_queue.empty()) {
 						auto &st = it->second;
 						auto *p = st.out_queue.data();
 						size_t sz = st.out_queue.size();
-						lk.unlock();
 						ssize_t wn = ::send(fd, p, sz, 0);
-						lk.lock();
 						if (wn > 0) {
 							if (cbs_.on_write)
 								cbs_.on_write(fd, (size_t)wn);
@@ -516,6 +422,13 @@ class DevPollEngine : public INetEngine {
 					}
 				}
 			}
+		close_expired(std::chrono::steady_clock::now());
+		return true;
+	}
+
+	void event_loop(std::atomic<bool> &run_flag, int32_t wait_ms) override {
+		while (run_flag.load(std::memory_order_relaxed)) {
+			(void)loop_once((wait_ms < 0) ? 0xFFFFFFFFu : (uint32_t)wait_ms);
 		}
 	}
 };
