@@ -55,6 +55,9 @@ int main() {
 		return 1;
 	}
 
+	// Optional diagnostics: reset broken-pipe counter before scenario
+	io::reset_broken_pipe_count();
+
 	std::atomic<bool> connected{false};
 	std::atomic<bool> done{false};
 	std::atomic<int> exit_code{1};
@@ -165,6 +168,12 @@ int main() {
 
 	engine->disconnect(fd);
 	engine->destroy();
+
+	// Optional diagnostics: print broken-pipe counter after scenario
+	{
+		auto bp = io::broken_pipe_count();
+		std::cout << "broken-pipe count = " << static_cast<unsigned long long>(bp) << std::endl;
+	}
 #if defined(_WIN32) || defined(_WIN64)
 	WSACleanup();
 #endif

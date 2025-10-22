@@ -13,6 +13,16 @@
 - Логирование завершения connect (SO_ERROR) во всех бэкендах в Debug-сборке
 - Дополнительно (Windows/IOCP): настройка глубины AcceptEx и авто-тюнинг
 
+### Поведение при закрытом peer (SIGPIPE/EPIPE)
+
+- На POSIX-платформах библиотека подавляет SIGPIPE один раз на процесс внутри инициализации бэкенда, чтобы запись в уже закрытый peer не завершала процесс. Для этого используется утилита `io::suppress_sigpipe_once()`.
+- В write‑пути при ошибках `EPIPE`/`ECONNRESET` библиотека единообразно:
+	- логирует событие в Debug‑сборках,
+	- снимает интерес к записи (EPOLLOUT/EVFILT_WRITE/POLLOUT) и очищает `want_write`,
+	- ожидает дальнейшее закрытие по стандартным событиям (ERR/HUP/RDHUP) без лишнего кручения цикла.
+
+Диагностика «сломанных записей» (см. ниже) позволяет оценить частоту таких ситуаций при нагрузке.
+
 ## Быстрый старт
 
 ```bash
@@ -128,6 +138,23 @@ cmake --install build/release --prefix ./_install
 	```
 	Замечание: это принудительный приём; рекомендуется использовать Debug/asan/tsan/ubsan для отладки.
 
+### Диагностика: счётчик «broken pipe»
+
+Для оценки частоты неудачных записей (EPIPE/ECONNRESET) доступен простой счётчик:
+
+```cpp
+// Обнулить перед сценарием
+io::reset_broken_pipe_count();
+
+// ... выполнить тест/нагрузку ...
+
+// Прочитать значение
+auto bp = io::broken_pipe_count();
+std::fprintf(stderr, "broken-pipe count = %llu\n", static_cast<unsigned long long>(bp));
+```
+
+Счётчик инкрементируется из всех Unix‑бэкендов при перехвате `EPIPE`/`ECONNRESET` в `send()`.
+
 ## Мини-пример
 
 ```cpp
@@ -139,6 +166,9 @@ cbs.on_close = [](socket_t s){};
 std::unique_ptr<io::INetEngine> eng(io::create_engine());
 eng->init(cbs);
 
+// (Необязательно) Диагностика: обнулить счётчик "broken pipe" перед сценарием
+io::reset_broken_pipe_count();
+
 socket_t listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
 if (listen_fd == io::kInvalidSocket) { /* handle error */ }
 // bind/listen ...
@@ -149,6 +179,12 @@ static char buf[4096];
 eng->add_socket(cli, buf, sizeof(buf), cbs.on_read);
 eng->connect(cli, "127.0.0.1", 12345, true);
 eng->set_read_timeout(cli, 5000); // 5s idle таймаут
+
+// ... выполнить взаимодействие клиент↔сервер ...
+
+// (Необязательно) Прочитать счётчик после сценария
+auto bp = io::broken_pipe_count();
+std::fprintf(stderr, "broken-pipe count = %llu\n", static_cast<unsigned long long>(bp));
 ```
 Примечание про переносимость сокетов
 - В API используется тип `socket_t`: на Windows это `SOCKET`, на POSIX — `int32_t`.
@@ -271,6 +307,27 @@ ctest --test-dir ./build/tsan -R NetHighload.ManyClientsEchoNoBlock --repeat-unt
 	- Event Ports: таймеры через `timer_create` + `SIGEV_PORT` (событие приходит в порт).
 	- /dev/poll: эмуляция через pipe и отдельный поток-таймер per-socket.
 - Логирование SO_ERROR при завершении connect включено в обоих бэкендах (Debug).
+
+### Запуск стресс‑сценариев на Solaris
+
+В репозитории есть готовые сценарии для удалённого запуска на Solaris‑хосте (настройки — `scripts/solaris/.env`).
+
+```bash
+# Синхронизировать проект на удалённый Solaris
+bash scripts/solaris/solaris_sync.sh
+
+# Сконфигурировать и собрать
+bash scripts/solaris/solaris_configure.sh
+bash scripts/solaris/solaris_build.sh
+
+# Последовательный стресс (повторы до 300 раз)
+bash scripts/solaris/solaris_stress_highload.sh 300
+
+# Параллельная фаза (4 инстанса) + стресс (200 повторов)
+bash scripts/solaris/solaris_parallel_and_stress.sh 4 200
+```
+
+Логи тестов сохраняются в каталоге сборки (например, `build/sol/ctest_stress_highload.log`).
 
 ## Совместимость и ограничения
 

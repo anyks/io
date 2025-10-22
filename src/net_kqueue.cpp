@@ -94,6 +94,7 @@ class KqueueEngine : public INetEngine {
 		std::vector<char> out_queue;
 		bool want_write{false};
 		bool connecting{false};
+		bool paused{false};
 	};
 	std::mutex mtx_;
 	std::unordered_map<socket_t, SockState> sockets_;
@@ -112,6 +113,8 @@ INetEngine *create_engine_kqueue() {
 
 bool KqueueEngine::init(const NetCallbacks &cbs) {
 	cbs_ = cbs;
+	// Suppress SIGPIPE (POSIX) once per process
+	io::suppress_sigpipe_once();
 	kq_ = kqueue();
 	if (kq_ == -1)
 		return false;
@@ -136,6 +139,7 @@ bool KqueueEngine::init(const NetCallbacks &cbs) {
 
 void KqueueEngine::destroy() {
 	if (kq_ != -1) {
+		// Stop loop
 		running_ = false;
 		if (user_pipe_[1] != -1) {
 			uint32_t v = 0;
@@ -143,6 +147,27 @@ void KqueueEngine::destroy() {
 		}
 		if (loop_.joinable())
 			loop_.join();
+		// Best-effort cleanup of all tracked sockets/listeners and timers
+		{
+			std::lock_guard<std::mutex> lk(mtx_);
+			for (auto &kv : sockets_) {
+				socket_t fd = kv.first;
+				struct kevent ev{};
+				EV_SET(&ev, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+				(void)kevent(kq_, &ev, 1, nullptr, 0, nullptr);
+				EV_SET(&ev, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+				(void)kevent(kq_, &ev, 1, nullptr, 0, nullptr);
+				EV_SET(&ev, fd, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
+				(void)kevent(kq_, &ev, 1, nullptr, 0, nullptr);
+				if (cbs_.on_close)
+					cbs_.on_close(fd);
+				::shutdown(fd, SHUT_RDWR);
+				::close(fd);
+			}
+			sockets_.clear();
+			listeners_.clear();
+			timeouts_ms_.clear();
+		}
 		if (user_pipe_[0] != -1)
 			close(user_pipe_[0]);
 		if (user_pipe_[1] != -1)
@@ -218,8 +243,15 @@ bool KqueueEngine::connect(socket_t fd, const char *host, uint16_t port, bool as
 		if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0) {
 			IO_LOG_DBG("connect completion fd=%d, SO_ERROR=%d (%s)", (int)fd, soerr, std::strerror(soerr));
 		}
+		bool paused = false;
+		{
+			std::lock_guard<std::mutex> lk(mtx_);
+			auto it = sockets_.find(fd);
+			if (it != sockets_.end())
+				paused = it->second.paused;
+		}
 		struct kevent ev{};
-		EV_SET(&ev, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+		EV_SET(&ev, fd, EVFILT_READ, EV_ADD | (paused ? EV_DISABLE : EV_ENABLE), 0, 0, nullptr);
 		(void)::kevent(kq_, &ev, 1, nullptr, 0, nullptr);
 		IO_LOG_DBG("connect: established fd=%d", (int)fd);
 		if (cbs_.on_accept)
@@ -399,6 +431,15 @@ void KqueueEngine::event_loop() {
 						if (fl < 0)
 							fl = 0;
 						fcntl(client, F_SETFL, fl | O_NONBLOCK);
+						// Предрегистрация клиента в sockets_ с пустым буфером до add_socket
+						{
+							std::lock_guard<std::mutex> lk(mtx_);
+							SockState st{};
+							st.buf = nullptr;
+							st.buf_size = 0;
+							st.read_cb = ReadCallback{};
+							sockets_.emplace(client, std::move(st));
+						}
 						cur_conn_++;
 						IO_LOG_DBG("accept: client fd=%d", (int)client);
 						if (cbs_.on_accept)
@@ -414,6 +455,8 @@ void KqueueEngine::event_loop() {
 				}
 				auto st = it->second;
 				lk.unlock();
+				if (st.paused)
+					continue; // respect paused even if EVFILT_READ was delivered earlier
 				if (!st.buf || st.buf_size == 0 || !st.read_cb)
 					continue;
 				ssize_t n = recv(fd, st.buf, st.buf_size, 0);
@@ -492,7 +535,17 @@ void KqueueEngine::event_loop() {
 					ssize_t n = send(fd, data_ptr, data_len, 0);
 					lk.lock();
 					if (n < 0) {
-						IO_LOG_ERR("send(fd=%d) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno));
+						int e = errno;
+						IO_LOG_ERR("send(fd=%d) failed errno=%d (%s)", (int)fd, e, std::strerror(e));
+						if (e == EPIPE || e == ECONNRESET) {
+							io::record_broken_pipe();
+							IO_LOG_DBG("write: fd=%d EPIPE/ECONNRESET -> drop OUT, want_write=0", (int)fd);
+							// Drop EVFILT_WRITE and clear want_write to avoid spinning
+							struct kevent wev{};
+							EV_SET(&wev, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+							(void)kevent(kq_, &wev, 1, nullptr, 0, nullptr);
+							st.want_write = false;
+						}
 					}
 					if (n > 0) {
 						if (cbs_.on_write)
@@ -530,6 +583,12 @@ bool KqueueEngine::set_read_timeout(socket_t fd, uint32_t timeout_ms) {
 }
 
 bool KqueueEngine::pause_read(socket_t socket) {
+	{
+		std::lock_guard<std::mutex> lk(mtx_);
+		auto it = sockets_.find(socket);
+		if (it != sockets_.end())
+			it->second.paused = true;
+	}
 	struct kevent ev{};
 	EV_SET(&ev, socket, EVFILT_READ, EV_DISABLE, 0, 0, nullptr);
 	if (kevent(kq_, &ev, 1, nullptr, 0, nullptr) < 0) {
@@ -540,6 +599,12 @@ bool KqueueEngine::pause_read(socket_t socket) {
 }
 
 bool KqueueEngine::resume_read(socket_t socket) {
+	{
+		std::lock_guard<std::mutex> lk(mtx_);
+		auto it = sockets_.find(socket);
+		if (it != sockets_.end())
+			it->second.paused = false;
+	}
 	struct kevent ev{};
 	EV_SET(&ev, socket, EVFILT_READ, EV_ENABLE, 0, 0, nullptr);
 	if (kevent(kq_, &ev, 1, nullptr, 0, nullptr) < 0) {

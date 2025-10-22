@@ -139,13 +139,25 @@ if (IO_BUILD_TESTS)
     add_executable(io_tests tests/io_tests.cpp)
     target_link_libraries(io_tests PRIVATE io GTest::gtest_main)
   else()
-    add_executable(io_tests tests/io_tests.cpp tests/net_integration_tests.cpp tests/net_highload_tests.cpp tests/net_limits_tests.cpp tests/net_timeout_tests.cpp tests/net_pause_resume_tests.cpp tests/net_timeout_pause_tests.cpp tests/net_pause_resume_server_tests.cpp tests/net_pause_multi_timeout_tests.cpp)
+    add_executable(io_tests
+      tests/io_tests.cpp
+      tests/net_integration_tests.cpp
+      tests/net_highload_tests.cpp
+      tests/net_limits_tests.cpp
+      tests/net_timeout_tests.cpp
+      tests/net_pause_resume_tests.cpp
+      tests/net_timeout_pause_tests.cpp
+      tests/net_pause_resume_server_tests.cpp
+      tests/net_pause_multi_timeout_tests.cpp
+      tests/net_write_closed_tests.cpp
+      tests/net_egain_partial_write_tests.cpp
+    )
     target_link_libraries(io_tests PRIVATE io GTest::gtest_main)
   endif()
   include(GoogleTest)
-  # Ensure tests won't hang forever: set a global per-test timeout (can be overridden by CTest args)
-  gtest_discover_tests(io_tests)
-  set(CTEST_TEST_TIMEOUT 120)
+  # Ensure tests won't hang forever: set a per-test timeout (can be overridden by CTest args or per-test props)
+  set(IO_TEST_TIMEOUT 180 CACHE STRING "Default timeout (s) for each test")
+  gtest_discover_tests(io_tests PROPERTIES TIMEOUT ${IO_TEST_TIMEOUT})
 endif()
 
 # Install rules

@@ -60,14 +60,33 @@ class IouringEngine : public INetEngine {
 	}
 
 	void destroy() override {
+		// Stop the event loop thread first
 		running_ = false;
-		// poke ring by posting user event
 		if (user_efd_ != -1) {
 			uint64_t one = 1;
 			(void)::write(user_efd_, &one, sizeof(one));
 		}
 		if (loop_.joinable())
 			loop_.join();
+		// Best-effort cleanup of tracked sockets and listeners
+		{
+			std::lock_guard<std::mutex> lk(mtx_);
+			for (auto &kv : sockets_) {
+				socket_t fd = kv.first;
+				// invoke on_close before closing
+				if (cbs_.on_close)
+					cbs_.on_close(fd);
+				::shutdown(fd, SHUT_RDWR);
+				::close(fd);
+			}
+			for (auto lfd : listeners_) {
+				::close(lfd);
+			}
+			sockets_.clear();
+			listeners_.clear();
+			timeouts_fd_.clear();
+			timeouts_ud_.clear();
+		}
 		if (user_efd_ != -1) {
 			::close(user_efd_);
 			user_efd_ = -1;
@@ -308,6 +327,12 @@ class IouringEngine : public INetEngine {
 							fcntl(client, F_SETFL, fl | O_NONBLOCK);
 							cur_conn_++;
 							IO_LOG_DBG("accept: client fd=%d", (int)client);
+							// Предрегистрация клиента в sockets_ с пустым буфером до add_socket
+							{
+								std::lock_guard<std::mutex> lk(mtx_);
+								SockState st{};
+								sockets_.emplace(client, std::move(st));
+							}
 							if (cbs_.on_accept)
 								cbs_.on_accept(client);
 							// auto-recv only after user adds socket with buffer via add_socket

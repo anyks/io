@@ -11,12 +11,10 @@ fi
 
 ssh -p "${SOLARIS_SSH_PORT}" ${SOLARIS_SSH_OPTS} "${SOLARIS_SSH}" bash -s -- \
   "${SOLARIS_DIR}" \
-  "${SOLARIS_BUILD}" <<'REMOTE_SCRIPT'
+  "${SOLARIS_BUILD}" \
+  "${SOLARIS_CTEST}" <<'REMOTE_SCRIPT'
 set -euo pipefail
-SOLARIS_DIR="$1"; SOLARIS_BUILD="$2"
-cd "$SOLARIS_DIR/$SOLARIS_BUILD"
-echo "Server:"; ./example_server &
-sleep 1
-echo "Client:"; ./example_client || true
-pkill example_server || true
+SOLARIS_DIR="$1"; SOLARIS_BUILD="$2"; SOLARIS_CTEST="$3"
+cd "$SOLARIS_DIR"
+"$SOLARIS_CTEST" --test-dir "$SOLARIS_BUILD" -N | sed -n '1,200p'
 REMOTE_SCRIPT

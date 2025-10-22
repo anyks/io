@@ -509,6 +509,12 @@ void IocpEngine::loop() {
 				}
 			}
 			if (newfd != (socket_t)INVALID_SOCKET) {
+				// Предрегистрация клиента в sockets_ с пустым буфером до add_socket
+				{
+					std::lock_guard<std::mutex> lk(mtx_);
+					SockState st{}; // defaults are fine (no pending read yet)
+					sockets_.emplace(newfd, std::move(st));
+				}
 				IO_LOG_DBG("accept: new socket=%p", (void *)(uintptr_t)newfd);
 				if (cbs_.on_accept)
 					cbs_.on_accept(newfd);

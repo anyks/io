@@ -43,6 +43,9 @@ int main() {
 		return 1;
 	}
 
+	// Optional diagnostics: reset broken-pipe counter at server start
+	io::reset_broken_pipe_count();
+
 	// Per-connection read buffers and partial frame storage
 	std::unordered_map<socket_t, std::vector<char>> accum;
 	std::unordered_map<socket_t, std::vector<char>> readbufs;
@@ -113,12 +116,22 @@ int main() {
 
 	std::cout << "Echo server up on 0.0.0.0:8080 (press Ctrl+C to quit)" << std::endl;
 	// Keep process alive
+	uint64_t last_bp = 0;
+	unsigned tick = 0;
 	for (;;) {
 #if defined(_WIN32) || defined(_WIN64)
 		::Sleep(1000);
 #else
 		::sleep(1);
 #endif
+		// Periodically print broken-pipe counter (every ~30s or on change)
+		if ((++tick % 30u) == 0u) {
+			auto bp = io::broken_pipe_count();
+			if (bp != last_bp) {
+				std::cout << "broken-pipe count = " << static_cast<unsigned long long>(bp) << std::endl;
+				last_bp = bp;
+			}
+		}
 	}
 
 #if defined(_WIN32) || defined(_WIN64)

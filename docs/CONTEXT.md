@@ -139,3 +139,36 @@ Notes
 - Ensure `cmake`/`ctest`/`gdb` are installed on Solaris. If needed, set absolute paths in `.env`.
 - Event Ports backend is enabled with `-DIO_WITH_EVENTPORTS=ON` (default). `/dev/poll` fallback with `OFF`.
 - If tests fail, grab failing output and share. For event ports timing issues, also check system logs.
+
+## Solaris timing: event ports, timers, and port_getn behavior
+
+Context
+- Initial attempt to use kernel timers with SIGEV_PORT (timer_create/timer_settime) failed with EPERM under non-privileged users on Solaris/Illumos.
+- To avoid privilege requirements and flakiness, we implemented software timers integrated with the event-loop via a user pipe.
+
+Implementation
+- A dedicated timer thread tracks per-socket deadlines (std::chrono) and wakes at the nearest deadline.
+- On expiry, the thread writes a small notification into the event-loop's user pipe to wake the loop; expired FDs are processed in the main loop.
+- Data structures: a map of socket -> {timeout_ms, deadline, active}; guarded by a mutex and condition_variable.
+- Rearm semantics: deadlines refresh on successful reads; when reads are paused (pause_read), timers are suspended; on resume_read, timers continue and can expire if the remaining time elapses.
+- File reference: `src/net_eventports.cpp` (look for `timer_loop`, `timers_`, and user-pipe handling).
+
+port_getn
+- We use blocking `port_getn` (passing nullptr timeout). Spurious ETIME returns previously caused flaky timeouts; treating ETIME like EINTR (ignored) stabilized the loop.
+
+Behavior and guarantees
+- Per-socket read timeouts: idle sockets close after timeout_ms without reads; any read activity resets the deadline.
+- Pause/Resume: while paused, a socket won't be closed by the timeout; resuming re-enables the countdown from the remaining budget.
+- User events and accept/read/write readiness continue to work unaffected; listener and user-pipe are re-armed appropriately on each loop.
+
+Trade-offs
+- No special privileges required; consistent behavior across systems.
+- Minor jitter may occur (sub-few-milliseconds) due to thread wake-ups and scheduling; validated as acceptable by tests.
+
+Validation status (Solaris)
+- Full suite passing: 13/13 tests PASS.
+- Representative timings: NetTimeout.ReadIdleCloseClient ~113 ms, NetTimeout.DisableTimeout ~612 ms, NetPauseResume.* ~112 ms.
+- Run via: `scripts/solaris/solaris_test.sh` (stores logs in `build/sol/ctest_last.log`).
+
+Related scripts
+- `scripts/solaris/solaris_sync.sh`, `solaris_configure.sh`, `solaris_build.sh`, `solaris_test.sh` — end-to-end loop for remote Solaris.

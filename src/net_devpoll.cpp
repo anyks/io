@@ -36,6 +36,8 @@ class DevPollEngine : public INetEngine {
 	}
 	bool init(const NetCallbacks &cbs) override {
 		cbs_ = cbs;
+		// Suppress SIGPIPE (POSIX) once per process
+		io::suppress_sigpipe_once();
 		dpfd_ = ::open("/dev/poll", O_RDWR);
 		if (dpfd_ < 0) {
 			IO_LOG_ERR("open(/dev/poll) failed errno=%d (%s)", errno, std::strerror(errno));
@@ -61,6 +63,28 @@ class DevPollEngine : public INetEngine {
 			}
 			if (loop_.joinable())
 				loop_.join();
+			// Cleanup all tracked sockets and timers
+			{
+				std::lock_guard<std::mutex> lk(mtx_);
+				for (auto &kv : sockets_) {
+					int fd = (int)kv.first;
+					rem_poll(fd);
+					if (cbs_.on_close)
+						cbs_.on_close(kv.first);
+					::shutdown(fd, SHUT_RDWR);
+					::close(fd);
+				}
+				for (auto &tkv : timers_) {
+					int tfd = tkv.second;
+					rem_poll(tfd);
+					::close(tfd);
+				}
+				sockets_.clear();
+				timers_.clear();
+				timer_targets_.clear();
+				listeners_.clear();
+				timeouts_ms_.clear();
+			}
 			if (user_pipe_[0] != -1)
 				::close(user_pipe_[0]);
 			if (user_pipe_[1] != -1)
@@ -78,7 +102,7 @@ class DevPollEngine : public INetEngine {
 			std::lock_guard<std::mutex> lk(mtx_);
 			sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false, false};
 		}
-		add_poll(fd, POLLIN | POLLRDHUP);
+		add_poll(fd, POLLIN | POLLRDNORM | POLLHUP);
 		return true;
 	}
 	bool delete_socket(socket_t fd) override {
@@ -113,13 +137,13 @@ class DevPollEngine : public INetEngine {
 			cur = 0;
 		fcntl(fd, F_SETFL, cur | O_NONBLOCK);
 		if (r == 0) {
-			add_poll(fd, POLLIN | POLLRDHUP);
+			add_poll(fd, POLLIN | POLLRDNORM | POLLHUP);
 			if (cbs_.on_accept)
 				cbs_.on_accept(fd);
 			return true;
 		}
 		if (async && (err == EINPROGRESS)) {
-			add_poll(fd, POLLOUT | POLLIN | POLLRDHUP);
+			add_poll(fd, POLLOUT | POLLIN | POLLRDNORM | POLLHUP);
 			std::lock_guard<std::mutex> lk(mtx_);
 			sockets_[fd].connecting = true;
 			return true;
@@ -159,7 +183,7 @@ class DevPollEngine : public INetEngine {
 		st.out_queue.insert(st.out_queue.end(), data, data + data_size);
 		if (!st.want_write) {
 			st.want_write = true;
-			add_poll(fd, POLLIN | POLLOUT | POLLRDHUP);
+			add_poll(fd, POLLIN | POLLRDNORM | POLLOUT | POLLHUP);
 		}
 		return true;
 	}
@@ -169,7 +193,7 @@ class DevPollEngine : public INetEngine {
 		if (it == sockets_.end())
 			return false;
 		it->second.paused = true;
-		short mask = POLLRDHUP;
+		short mask = POLLHUP;
 		if (it->second.want_write)
 			mask |= POLLOUT;
 		add_poll(socket, mask);
@@ -181,7 +205,7 @@ class DevPollEngine : public INetEngine {
 		if (it == sockets_.end())
 			return false;
 		it->second.paused = false;
-		short mask = POLLIN | POLLRDHUP;
+		short mask = POLLIN | POLLRDNORM | POLLHUP;
 		if (it->second.want_write)
 			mask |= POLLOUT;
 		add_poll(socket, mask);
@@ -192,6 +216,14 @@ class DevPollEngine : public INetEngine {
 			return false;
 		ssize_t n = ::write(user_pipe_[1], &val, sizeof(val));
 		return n == (ssize_t)sizeof(val);
+	}
+	// IOCP-specific APIs: provide no-op implementations for non-IOCP backends
+	bool set_accept_depth(socket_t /*listen_socket*/, uint32_t /*depth*/) override { return true; }
+	bool set_accept_depth_ex(socket_t listen_socket, uint32_t depth, bool /*aggressive_cancel*/) override {
+		return set_accept_depth(listen_socket, depth);
+	}
+	bool set_accept_autotune(socket_t /*listen_socket*/, const AcceptAutotuneConfig &/*cfg*/) override {
+		return true;
 	}
 	bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
 		// /dev/poll не умеет таймеры; эмулируем через pipe и отдельный поток, как и в event ports выше
@@ -275,7 +307,7 @@ class DevPollEngine : public INetEngine {
 	void rem_poll(int fd) {
 		struct pollfd p{};
 		p.fd = fd;
-		p.events = 0;
+		p.events = POLLREMOVE; // remove fd from /dev/poll set
 		p.revents = 0;
 		ssize_t wr = ::write(dpfd_, &p, sizeof(p));
 		if (wr != (ssize_t)sizeof(p)) {
@@ -286,10 +318,10 @@ class DevPollEngine : public INetEngine {
 	void event_loop() {
 		while (running_) {
 			dvpoll dv{};
-			pollfd evs[128];
+			pollfd evs[1024];
 			dv.dp_fds = evs;
-			dv.dp_nfds = 128;
-			dv.dp_timeout = 1000;
+			dv.dp_nfds = 1024;
+			dv.dp_timeout = 200;
 			int n = ::ioctl(dpfd_, DP_POLL, &dv);
 			if (n < 0) {
 				if (errno == EINTR)
@@ -363,6 +395,15 @@ class DevPollEngine : public INetEngine {
 						if (fl < 0)
 							fl = 0;
 						fcntl(client, F_SETFL, fl | O_NONBLOCK);
+						// Предрегистрация клиента в sockets_ с пустым буфером до add_socket
+						{
+							std::lock_guard<std::mutex> lk(mtx_);
+							SockState st{};
+							st.buf = nullptr;
+							st.buf_size = 0;
+							st.read_cb = ReadCallback{};
+							sockets_.emplace((socket_t)client, std::move(st));
+						}
 						cur_conn_++;
 						IO_LOG_DBG("accept: client fd=%d", (int)client);
 						if (cbs_.on_accept)
@@ -389,6 +430,8 @@ class DevPollEngine : public INetEngine {
 							IO_LOG_DBG("connect: established fd=%d", fd);
 							if (cbs_.on_accept)
 								cbs_.on_accept(fd);
+							// drop POLLOUT, keep read interest
+							add_poll(fd, POLLIN | POLLHUP);
 						} else {
 							lk.unlock();
 							if (cbs_.on_close)
@@ -400,7 +443,7 @@ class DevPollEngine : public INetEngine {
 						}
 					}
 				}
-				if (re & POLLIN) {
+				if (re & (POLLIN | POLLRDNORM)) {
 					std::unique_lock<std::mutex> lk(mtx_);
 					auto it = sockets_.find(fd);
 					if (it == sockets_.end()) {
@@ -418,8 +461,11 @@ class DevPollEngine : public INetEngine {
 					if (rn > 0) {
 						st.read_cb(fd, st.buf, (size_t)rn);
 					} else if (rn == 0 || (re & (POLLHUP | POLLERR))) {
+						// peer closed or error: remove from poll set and close fd
+						rem_poll(fd);
 						if (cbs_.on_close)
 							cbs_.on_close(fd);
+						::close(fd);
 						std::lock_guard<std::mutex> lk2(mtx_);
 						sockets_.erase(fd);
 						if (cur_conn_ > 0)
@@ -448,9 +494,20 @@ class DevPollEngine : public INetEngine {
 							if (cbs_.on_write)
 								cbs_.on_write(fd, (size_t)wn);
 							st.out_queue.erase(st.out_queue.begin(), st.out_queue.begin() + wn);
+						} else if (wn < 0) {
+							int e = errno;
+							if (e == EPIPE || e == ECONNRESET) {
+								io::record_broken_pipe();
+								IO_LOG_DBG("write: fd=%d EPIPE/ECONNRESET -> drop OUT, want_write=0", fd);
+								// Drop OUT and clear want_write quickly
+								short mask = POLLHUP;
+								if (!st.paused) mask |= POLLIN | POLLRDNORM;
+								add_poll(fd, mask);
+								st.want_write = false;
+							}
 						}
 						if (st.out_queue.empty()) {
-							short mask = POLLRDHUP;
+							short mask = POLLHUP;
 							if (!st.paused)
 								mask |= POLLIN;
 							add_poll(fd, mask);
@@ -462,6 +519,7 @@ class DevPollEngine : public INetEngine {
 		}
 	}
 };
+
 
 INetEngine *create_engine_devpoll() {
 	return new DevPollEngine();

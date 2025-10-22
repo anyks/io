@@ -48,7 +48,9 @@ class EpollEngine : public INetEngine {
 	}
 	bool init(const NetCallbacks &cbs) override {
 		cbs_ = cbs;
-		ep_ = ::epoll_create1(0);
+		// Suppress SIGPIPE (POSIX) once per process
+		io::suppress_sigpipe_once();
+		ep_ = ::epoll_create1(EPOLL_CLOEXEC);
 		if (ep_ < 0)
 			return false;
 		if (pipe(user_pipe_) == 0) {
@@ -81,6 +83,7 @@ class EpollEngine : public INetEngine {
 	}
 	void destroy() override {
 		if (ep_ != -1) {
+			// Stop loop and wake it
 			running_ = false;
 			if (user_pipe_[1] != -1) {
 				uint32_t v = 0;
@@ -88,6 +91,54 @@ class EpollEngine : public INetEngine {
 			}
 			if (loop_.joinable())
 				loop_.join();
+			// After loop stops, proactively close all tracked sockets and timers
+			{
+				std::vector<socket_t> to_close;
+				{
+					std::lock_guard<std::mutex> lk(mtx_);
+					to_close.reserve(sockets_.size());
+					for (auto &p : sockets_)
+						to_close.push_back(p.first);
+				}
+				for (socket_t fd : to_close) {
+					(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr);
+					if (cbs_.on_close)
+						cbs_.on_close(fd);
+					::shutdown(fd, SHUT_RDWR);
+					::close(fd);
+					IO_LOG_DBG("destroy: closed fd=%d", (int)fd);
+					bool dec = false;
+					{
+						std::lock_guard<std::mutex> lk(mtx_);
+						auto itS = sockets_.find(fd);
+						if (itS != sockets_.end()) {
+							dec = itS->second.server_side;
+							sockets_.erase(itS);
+						}
+					}
+					if (dec && cur_conn_ > 0)
+						cur_conn_--;
+					auto itT = timers_.find(fd);
+					if (itT != timers_.end()) {
+						int tfd = itT->second;
+						(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr);
+						::close(tfd);
+						owner_.erase(tfd);
+						timers_.erase(itT);
+					}
+					timeouts_ms_.erase(fd);
+				}
+				// Close and deregister listeners as well
+				{
+					std::lock_guard<std::mutex> lk(mtx_);
+					for (auto lfd : listeners_) {
+						(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, lfd, nullptr);
+						::shutdown(lfd, SHUT_RDWR);
+						::close(lfd);
+					}
+					listeners_.clear();
+				}
+			}
 			if (user_pipe_[0] != -1)
 				::close(user_pipe_[0]);
 			if (user_pipe_[1] != -1)
@@ -101,11 +152,63 @@ class EpollEngine : public INetEngine {
 		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 		{
 			std::lock_guard<std::mutex> lk(mtx_);
-			sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false};
+			// Если запись уже существует (например, connect(async) создал её ранее и установил connecting=true),
+			// то нельзя перетирать состояние по умолчанию, иначе потеряем флаги (connecting/want_write/очередь).
+			auto it = sockets_.find(fd);
+			if (it == sockets_.end()) {
+				SockState st;
+				st.buf = buffer;
+				st.buf_size = buffer_size;
+				st.read_cb = std::move(cb);
+				// Определим, подключён ли уже сокет (например, серверный accept'нутый), чтобы сделать его активным.
+				sockaddr_storage peer{}; socklen_t slen = sizeof(peer);
+				if (::getpeername(fd, (sockaddr*)&peer, &slen) == 0) {
+					st.active = true;
+				}
+				sockets_.emplace(fd, std::move(st));
+#ifndef NDEBUG
+				IO_LOG_DBG("add_socket NEW fd=%d, buf=%p, size=%zu, active=%d", (int)fd, (void *)buffer, buffer_size,
+				           sockets_[fd].active ? 1 : 0);
+#endif
+			} else {
+#ifndef NDEBUG
+				IO_LOG_DBG(
+				    "add_socket UPDATE fd=%d, prev: buf=%p, size=%zu, connecting=%d, want_write=%d, out_q=%zu, active=%d",
+				    (int)fd,
+				    (void *)it->second.buf,
+				    it->second.buf_size,
+				    it->second.connecting ? 1 : 0,
+				    it->second.want_write ? 1 : 0,
+				    it->second.out_queue.size(),
+				    it->second.active ? 1 : 0);
+#endif
+				it->second.buf = buffer;
+				it->second.buf_size = buffer_size;
+				it->second.read_cb = std::move(cb);
+				// connecting/want_write/out_queue сохраняем как есть
+#ifndef NDEBUG
+				IO_LOG_DBG(
+				    "add_socket UPDATED fd=%d, now: buf=%p, size=%zu, connecting=%d, want_write=%d, out_q=%zu, active=%d",
+				    (int)fd,
+				    (void *)it->second.buf,
+				    it->second.buf_size,
+				    it->second.connecting ? 1 : 0,
+				    it->second.want_write ? 1 : 0,
+				    it->second.out_queue.size(),
+				    it->second.active ? 1 : 0);
+#endif
+			}
 		}
+
 		epoll_event ev{};
-		ev.events = EPOLLIN | EPOLLRDHUP;
-		ev.data.fd = fd;
+		// уважим возможную паузу (если запись уже существовала и была на паузе)
+		{
+			std::lock_guard<std::mutex> lk(mtx_);
+			auto it = sockets_.find(fd);
+			bool paused = (it != sockets_.end()) ? it->second.paused : false;
+			ev.events = (paused ? 0u : EPOLLIN) | EPOLLRDHUP;
+			ev.data.fd = fd;
+		}
 		if (::epoll_ctl(ep_, EPOLL_CTL_ADD, fd, &ev) != 0) {
 			if (errno == EEXIST) {
 				(void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
@@ -148,6 +251,10 @@ class EpollEngine : public INetEngine {
 		}
 		int r = ::connect(fd, (sockaddr *)&addr, sizeof(addr));
 		int err = (r == 0) ? 0 : errno;
+#ifndef NDEBUG
+		IO_LOG_DBG("connect start fd=%d, async=%d, res=%d, errno=%d (%s)", (int)fd, async ? 1 : 0, r, err,
+		           std::strerror(err));
+#endif
 		int cur = fcntl(fd, F_GETFL, 0);
 		if (cur < 0)
 			cur = 0;
@@ -156,9 +263,20 @@ class EpollEngine : public INetEngine {
 			// Успешное соединение установлено сразу. Не трогаем sockets_[fd],
 			// чтобы не потерять buffer/callback, заданные через add_socket.
 			// Лишь убеждаемся, что сокет подписан на чтение в epoll.
+			{
+				std::lock_guard<std::mutex> lk(mtx_);
+				auto it = sockets_.find(fd);
+				if (it != sockets_.end())
+					it->second.active = true;
+			}
 			epoll_event ev{};
-			ev.events = EPOLLIN | EPOLLRDHUP;
-			ev.data.fd = fd;
+			{
+				std::lock_guard<std::mutex> lk2(mtx_);
+				auto it2 = sockets_.find(fd);
+				bool paused = (it2 != sockets_.end()) ? it2->second.paused : false;
+				ev.events = (paused ? 0u : EPOLLIN) | EPOLLRDHUP;
+				ev.data.fd = fd;
+			}
 			// Попробуем MOD, если ещё не добавлен — fallback на ADD (ошибки игнорируем).
 			(void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
 			(void)::epoll_ctl(ep_, EPOLL_CTL_ADD, fd, &ev);
@@ -174,14 +292,31 @@ class EpollEngine : public INetEngine {
 					SockState st;
 					st.connecting = true;
 					sockets_.emplace(fd, std::move(st));
+#ifndef NDEBUG
+					IO_LOG_DBG("connect EINPROGRESS NEW state fd=%d (no prior add_socket)", (int)fd);
+#endif
 				} else {
 					it->second.connecting = true;
+#ifndef NDEBUG
+					IO_LOG_DBG("connect EINPROGRESS UPDATE state fd=%d (connecting=1)", (int)fd);
+#endif
 				}
 			}
 			epoll_event ev{};
-			ev.events = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
-			ev.data.fd = fd;
-			::epoll_ctl(ep_, EPOLL_CTL_ADD, fd, &ev);
+			{
+				std::lock_guard<std::mutex> lk2(mtx_);
+				auto it2 = sockets_.find(fd);
+				bool paused = (it2 != sockets_.end()) ? it2->second.paused : false;
+				ev.events = EPOLLOUT | (paused ? 0u : EPOLLIN) | EPOLLRDHUP;
+				ev.data.fd = fd;
+			}
+			if (::epoll_ctl(ep_, EPOLL_CTL_ADD, fd, &ev) != 0) {
+				if (errno == EEXIST) {
+					(void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
+				} else {
+					IO_LOG_ERR("epoll_ctl(ADD fd=%d for connect) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno));
+				}
+			}
 			return true;
 		}
 		// immediate failure path (not in-progress)
@@ -190,6 +325,28 @@ class EpollEngine : public INetEngine {
 	}
 	bool disconnect(socket_t fd) override {
 		if (fd >= 0) {
+			// Сначала удалим из epoll и внутреннего состояния, затем закроем fd.
+			(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr);
+			bool dec = false;
+			{
+				std::lock_guard<std::mutex> lk(mtx_);
+				auto it = sockets_.find(fd);
+				if (it != sockets_.end()) {
+					dec = it->second.server_side;
+					sockets_.erase(it);
+				}
+				auto itT = timers_.find(fd);
+				if (itT != timers_.end()) {
+					int tfd = itT->second;
+					::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr);
+					::close(tfd);
+					owner_.erase(tfd);
+					timers_.erase(itT);
+				}
+				timeouts_ms_.erase(fd);
+			}
+			if (dec && cur_conn_ > 0)
+				cur_conn_--;
 			::shutdown(fd, SHUT_RDWR);
 			::close(fd);
 			IO_LOG_DBG("close: fd=%d", (int)fd);
@@ -228,12 +385,43 @@ class EpollEngine : public INetEngine {
 		if (it == sockets_.end())
 			return false;
 		auto &st = it->second;
+		// Append to the logical end; if we've consumed a large prefix, compact first to avoid unbounded growth
+		if (st.out_head > 0) {
+			// Compact if consumed prefix is large (>= 64KB) and >= remaining payload
+			size_t remaining = st.out_queue.size() - st.out_head;
+			if (st.out_head >= 64 * 1024 && st.out_head >= remaining) {
+				// Move remaining bytes to the beginning
+				if (remaining > 0)
+					std::memmove(st.out_queue.data(), st.out_queue.data() + st.out_head, remaining);
+				st.out_queue.resize(remaining);
+				st.out_head = 0;
+			}
+		}
 		st.out_queue.insert(st.out_queue.end(), data, data + data_size);
+#ifndef NDEBUG
+		IO_LOG_DBG("write queued fd=%d, bytes=%zu, want_write=%d (queued_total=%zu, head=%zu)", (int)fd, data_size,
+		           st.want_write ? 1 : 0, st.out_queue.size(), st.out_head);
+#endif
 		if (!st.want_write) {
 			epoll_event ev{};
-			ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+			bool paused = st.paused;
+			ev.events = (paused ? 0u : EPOLLIN) | EPOLLOUT | EPOLLRDHUP;
 			ev.data.fd = fd;
-			(void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
+			int rc = ::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
+#ifndef NDEBUG
+			if (rc != 0) {
+				IO_LOG_ERR("epoll_ctl(MOD fd=%d flags=%s%s%s) failed errno=%d (%s)", (int)fd,
+				           (ev.events & EPOLLIN) ? "IN" : "",
+				           (ev.events & EPOLLOUT) ? "|OUT" : "",
+				           (ev.events & EPOLLRDHUP) ? "|HUP" : "",
+				           errno, std::strerror(errno));
+			} else {
+				IO_LOG_DBG("epoll MOD fd=%d -> %s%s%s", (int)fd,
+				           (ev.events & EPOLLIN) ? "IN" : "",
+				           (ev.events & EPOLLOUT) ? "|OUT" : "",
+				           (ev.events & EPOLLRDHUP) ? "|HUP" : "");
+			}
+#endif
 			st.want_write = true;
 		}
 		return true;
@@ -298,13 +486,19 @@ class EpollEngine : public INetEngine {
 		{
 			std::lock_guard<std::mutex> lk(mtx_);
 			auto it = sockets_.find(fd);
-			if (it != sockets_.end() && it->second.want_write)
-				ev.events |= EPOLLOUT;
+			if (it != sockets_.end()) {
+				it->second.paused = true;
+				if (it->second.want_write)
+					ev.events |= EPOLLOUT;
+			}
 		}
 		if (::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev) != 0) {
 			IO_LOG_ERR("epoll_ctl(MOD pause fd=%d) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno));
 			return false;
 		}
+#ifndef NDEBUG
+		IO_LOG_DBG("pause_read: fd=%d", (int)fd);
+#endif
 		return true;
 	}
 
@@ -315,13 +509,19 @@ class EpollEngine : public INetEngine {
 		{
 			std::lock_guard<std::mutex> lk(mtx_);
 			auto it = sockets_.find(fd);
-			if (it != sockets_.end() && it->second.want_write)
-				ev.events |= EPOLLOUT;
+			if (it != sockets_.end()) {
+				it->second.paused = false;
+				if (it->second.want_write)
+					ev.events |= EPOLLOUT;
+			}
 		}
 		if (::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev) != 0) {
 			IO_LOG_ERR("epoll_ctl(MOD resume fd=%d) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno));
 			return false;
 		}
+#ifndef NDEBUG
+		IO_LOG_DBG("resume_read: fd=%d", (int)fd);
+#endif
 		return true;
 	}
 
@@ -330,9 +530,13 @@ class EpollEngine : public INetEngine {
 		char *buf{nullptr};
 		size_t buf_size{0};
 		ReadCallback read_cb;
-		std::vector<char> out_queue;
+		std::vector<char> out_queue; // write buffer (prefix [0..out_head) consumed)
+		size_t out_head{0};          // logical start offset into out_queue
 		bool want_write{false};
 		bool connecting{false};
+		bool active{false}; // becomes true when socket is fully connected/usable for I/O
+		bool paused{false}; // suppress EPOLLIN while true
+		bool server_side{false}; // true for sockets accepted on the server (counted toward max_conn_)
 	};
 	int ep_{-1};
 	NetCallbacks cbs_{};
@@ -365,6 +569,30 @@ class EpollEngine : public INetEngine {
 			for (int i = 0; i < n; ++i) {
 				int fd = evs[i].data.fd;
 				uint32_t events = evs[i].events;
+				#ifndef NDEBUG
+				// Быстрый лог для событий по неизвестным fd (не в sockets_ и не таймер/pipe/листенер)
+				{
+					bool known = false;
+					{
+						std::lock_guard<std::mutex> lk(mtx_);
+						known = sockets_.find(fd) != sockets_.end();
+					}
+					bool is_timer = owner_.find(fd) != owner_.end();
+					bool is_user = (fd == user_pipe_[0]);
+					bool is_listener = false;
+					{
+						std::lock_guard<std::mutex> lk(mtx_);
+						is_listener = listeners_.find(fd) != listeners_.end();
+					}
+					if (!known && !is_timer && !is_user && !is_listener) {
+						IO_LOG_DBG("event(unknown) fd=%d ev=%s%s%s%s", fd,
+						           (events & EPOLLIN) ? "IN" : "",
+						           (events & EPOLLOUT) ? "|OUT" : "",
+						           (events & EPOLLERR) ? "|ERR" : "",
+						           (events & (EPOLLHUP | EPOLLRDHUP)) ? "|HUP" : "");
+					}
+				}
+				#endif
 				// timerfd fired?
 				if (owner_.find(fd) != owner_.end() && (events & EPOLLIN)) {
 					uint64_t exp;
@@ -378,13 +606,24 @@ class EpollEngine : public INetEngine {
 							sfd = it->second;
 					}
 					if (sfd != -1) {
+						// Timeout: report close and drop the socket sfd
 						if (cbs_.on_close)
 							cbs_.on_close(sfd);
+						(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, sfd, nullptr);
+						::shutdown(sfd, SHUT_RDWR);
 						::close(sfd);
-						std::lock_guard<std::mutex> lk(mtx_);
-						sockets_.erase(sfd);
-						if (cur_conn_ > 0)
+						bool dec = false;
+						{
+							std::lock_guard<std::mutex> lk2(mtx_);
+							auto itS = sockets_.find(sfd);
+							if (itS != sockets_.end()) {
+								dec = itS->second.server_side;
+								sockets_.erase(itS);
+							}
+						}
+						if (dec && cur_conn_ > 0)
 							cur_conn_--;
+						// Remove and close the timer fd
 						auto itT = timers_.find(sfd);
 						if (itT != timers_.end()) {
 							::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr);
@@ -440,6 +679,17 @@ class EpollEngine : public INetEngine {
 							::close(client);
 							continue;
 						}
+						// Register the client in sockets_ immediately with empty buffer/callback; mark as active.
+						{
+							std::lock_guard<std::mutex> lk(mtx_);
+							SockState st{};
+							st.buf = nullptr;
+							st.buf_size = 0;
+							st.read_cb = ReadCallback{};
+							st.active = true;
+							st.server_side = true;
+							sockets_.emplace(client, std::move(st));
+						}
 						cur_conn_++;
 						IO_LOG_DBG("accept: client fd=%d", (int)client);
 						if (cbs_.on_accept)
@@ -460,16 +710,30 @@ class EpollEngine : public INetEngine {
 						} else {
 							IO_LOG_DBG("connect completion fd=%d, SO_ERROR=%d (%s)", fd, err, std::strerror(err));
 						}
-						it->second.connecting = false;
+							it->second.connecting = false;
+							if (err == 0) {
+								it->second.active = true;
+							}
 						if (err == 0) {
 							lk.unlock();
 							IO_LOG_DBG("connect: established fd=%d", fd);
 							if (cbs_.on_accept)
 								cbs_.on_accept(fd);
+							// drop EPOLLOUT interest now that connection is established (respect pause)
+							epoll_event ev{};
+							{
+								std::lock_guard<std::mutex> lk2(mtx_);
+								auto it2 = sockets_.find(fd);
+								bool paused = (it2 != sockets_.end()) ? it2->second.paused : false;
+								ev.events = (paused ? 0u : EPOLLIN) | EPOLLRDHUP;
+								ev.data.fd = fd;
+							}
+							(void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
 						} else {
 							lk.unlock();
 							if (cbs_.on_close)
 								cbs_.on_close(fd);
+							(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr);
 							::close(fd);
 							std::lock_guard<std::mutex> lk2(mtx_);
 							sockets_.erase(fd);
@@ -482,22 +746,80 @@ class EpollEngine : public INetEngine {
 					auto it = sockets_.find(fd);
 					if (it != sockets_.end() && !it->second.out_queue.empty()) {
 						auto &st = it->second;
-						auto *p = st.out_queue.data();
-						size_t sz = st.out_queue.size();
+						const char *p = st.out_queue.data() + st.out_head;
+						size_t sz = st.out_queue.size() - st.out_head;
 						lk.unlock();
 						ssize_t wn = ::send(fd, p, sz, 0);
 						lk.lock();
-						if (wn < 0) {
-							IO_LOG_ERR("send(fd=%d) failed errno=%d (%s)", fd, errno, std::strerror(errno));
-						}
+							if (wn < 0) {
+								int e = errno;
+								if (e == EAGAIN || e == EWOULDBLOCK || e == EINTR) {
+									// Non-fatal: keep OUT and try again later
+								} else {
+									IO_LOG_ERR("send(fd=%d) failed errno=%d (%s)", fd, e, std::strerror(e));
+								}
+								if (e == EPIPE || e == ECONNRESET) {
+									io::record_broken_pipe();
+									IO_LOG_DBG("write: fd=%d EPIPE/ECONNRESET -> closing socket", fd);
+									// Treat broken pipe/reset as definitive close: notify, deregister and close fd
+									lk.unlock();
+									if (cbs_.on_close)
+										cbs_.on_close(fd);
+									( void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr);
+									::shutdown(fd, SHUT_RDWR);
+									::close(fd);
+									bool dec5 = false;
+									{
+										std::lock_guard<std::mutex> lk2(mtx_);
+										auto itE = sockets_.find(fd);
+										if (itE != sockets_.end()) {
+											dec5 = itE->second.server_side;
+											sockets_.erase(itE);
+										}
+									}
+									if (dec5 && cur_conn_ > 0)
+										cur_conn_--;
+									auto itT = timers_.find(fd);
+									if (itT != timers_.end()) {
+										int tfd = itT->second;
+										(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr);
+										::close(tfd);
+										owner_.erase(tfd);
+										timers_.erase(itT);
+									}
+									timeouts_ms_.erase(fd);
+									// Move to next event for this fd
+									continue;
+								}
+							}
 						if (wn > 0) {
+#ifndef NDEBUG
+							IO_LOG_DBG("send: fd=%d, wrote=%zd/%zu (head=%zu -> %zu, total=%zu)", fd, wn, sz, st.out_head,
+							           st.out_head + (size_t)wn, st.out_queue.size());
+#endif
 							if (cbs_.on_write)
 								cbs_.on_write(fd, (size_t)wn);
-							st.out_queue.erase(st.out_queue.begin(), st.out_queue.begin() + wn);
+							st.out_head += (size_t)wn;
+							// If fully consumed, reset the buffer to free memory and drop OUT below
+							if (st.out_head == st.out_queue.size()) {
+								st.out_queue.clear();
+								st.out_head = 0;
+							}
 						}
-						if (st.out_queue.empty()) {
+						// If nothing is left logically, drop EPOLLOUT and clear want_write
+						if (st.out_queue.empty() || st.out_head >= st.out_queue.size()) {
+							// Sanity normalize state when head passed size (shouldn't happen but be safe)
+							if (!st.out_queue.empty() && st.out_head > 0) {
+								// Compact remaining payload to the front
+								size_t remaining = st.out_queue.size() - st.out_head;
+								if (remaining > 0)
+									std::memmove(st.out_queue.data(), st.out_queue.data() + st.out_head, remaining);
+								st.out_queue.resize(remaining);
+								st.out_head = 0;
+							}
 							epoll_event ev{};
-							ev.events = EPOLLIN | EPOLLRDHUP;
+							bool paused_now = st.paused;
+							ev.events = (paused_now ? 0u : EPOLLIN) | EPOLLRDHUP;
 							ev.data.fd = fd;
 							if (::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev) != 0) {
 								IO_LOG_ERR("epoll_ctl(MOD fd=%d->IN) failed errno=%d (%s)", fd, errno,
@@ -516,14 +838,78 @@ class EpollEngine : public INetEngine {
 					}
 					auto st = it->second;
 					lk.unlock();
-					if (!st.buf || st.buf_size == 0 || !st.read_cb)
-						continue;
-					ssize_t rn = ::recv(fd, st.buf, st.buf_size, 0);
-					if (rn < 0) {
-						IO_LOG_ERR("recv(fd=%d) failed errno=%d (%s)", fd, errno, std::strerror(errno));
+#ifndef NDEBUG
+					{
+						int has_cb = st.read_cb ? 1 : 0;
+						IO_LOG_DBG("event fd=%d ev=%s%s%s%s, connecting=%d, active=%d, has_cb=%d, buf=%p, size=%zu",
+						           fd,
+						           (events & EPOLLIN) ? "IN" : "",
+						           (events & EPOLLOUT) ? "|OUT" : "",
+						           (events & EPOLLERR) ? "|ERR" : "",
+						           (events & (EPOLLHUP | EPOLLRDHUP)) ? "|HUP" : "",
+				           st.connecting ? 1 : 0,
+				           st.active ? 1 : 0,
+						           has_cb,
+						           (void *)st.buf,
+						           st.buf_size);
 					}
-					if (rn > 0) {
+#endif
+						// Если соединение ещё устанавливается или сокет не активирован — пропускаем обработку
+						// (избежим ENOTCONN и ложных HUP до подключения).
+						if (st.connecting || !st.active) {
+						continue;
+					}
+					bool did_read = false;
+					// Дрениуем только если есть буфер и коллбек, не на паузе и ядро сигнализирует IN; при чистом HUP/ERR чтение не пробуем.
+					bool paused_now = false;
+					{
+						std::lock_guard<std::mutex> lk2(mtx_);
+						auto it2 = sockets_.find(fd);
+						paused_now = (it2 != sockets_.end()) ? it2->second.paused : false;
+					}
+					if (!paused_now && (events & EPOLLIN) && st.buf && st.buf_size > 0 && st.read_cb) {
+					while (true) {
+						ssize_t rn = ::recv(fd, st.buf, st.buf_size, 0);
+						if (rn < 0) {
+							int e = errno;
+							if (e == EAGAIN || e == EWOULDBLOCK) {
+								break; // буфер пуст
+							}
+							IO_LOG_ERR("recv(fd=%d) failed errno=%d (%s)", fd, e, std::strerror(e));
+							break;
+						}
+						if (rn == 0) {
+							// Аккуратное закрытие peer
+							if (cbs_.on_close)
+								cbs_.on_close(fd);
+							(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr);
+							bool dec = false;
+							{
+								std::lock_guard<std::mutex> lk2(mtx_);
+								auto itS = sockets_.find(fd);
+								if (itS != sockets_.end()) {
+									dec = itS->second.server_side;
+									sockets_.erase(itS);
+								}
+							}
+							if (dec && cur_conn_ > 0)
+								cur_conn_--;
+							auto itT = timers_.find(fd);
+							if (itT != timers_.end()) {
+								int tfd = itT->second;
+								::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr);
+								::close(tfd);
+								owner_.erase(tfd);
+								timers_.erase(itT);
+							}
+							timeouts_ms_.erase(fd);
+							break;
+						}
+#ifndef NDEBUG
+						IO_LOG_DBG("recv: fd=%d, got=%zd", fd, rn);
+#endif
 						st.read_cb(fd, st.buf, (size_t)rn); // rearm timer if exists
+						did_read = true;
 						int tfd = -1;
 						uint32_t ms = 0;
 						{
@@ -543,22 +929,46 @@ class EpollEngine : public INetEngine {
 										   std::strerror(errno));
 							}
 						}
-					} else if (rn == 0 || (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))) {
-						if (cbs_.on_close)
-							cbs_.on_close(fd);
-						std::lock_guard<std::mutex> lk2(mtx_);
-						sockets_.erase(fd);
-						if (cur_conn_ > 0)
-							cur_conn_--;
-						auto itT = timers_.find(fd);
-						if (itT != timers_.end()) {
-							int tfd = itT->second;
-							::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr);
-							::close(tfd);
-							owner_.erase(tfd);
-							timers_.erase(itT);
 						}
-						timeouts_ms_.erase(fd);
+						}
+					// Отдельно обработаем EPOLLERR/HUP флаги, если данных так и не было (обрабатываем даже при отсутствии буфера/коллбека)
+					if (!did_read && (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))) {
+						bool fatal = false;
+						if (events & EPOLLERR) {
+							int soerr = 0;
+							socklen_t sl = sizeof(soerr);
+							if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr != 0)
+								fatal = true;
+						}
+						if (events & (EPOLLHUP | EPOLLRDHUP))
+							fatal = true;
+						if (fatal) {
+							if (cbs_.on_close)
+								cbs_.on_close(fd);
+							(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr);
+							::shutdown(fd, SHUT_RDWR);
+							::close(fd);
+							bool dec = false;
+							{
+								std::lock_guard<std::mutex> lk2(mtx_);
+								auto itS = sockets_.find(fd);
+								if (itS != sockets_.end()) {
+									dec = itS->second.server_side;
+									sockets_.erase(itS);
+								}
+							}
+							if (dec && cur_conn_ > 0)
+								cur_conn_--;
+							auto itT = timers_.find(fd);
+							if (itT != timers_.end()) {
+								int tfd = itT->second;
+								::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr);
+								::close(tfd);
+								owner_.erase(tfd);
+								timers_.erase(itT);
+							}
+							timeouts_ms_.erase(fd);
+						}
 					}
 				}
 			}

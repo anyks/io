@@ -93,3 +93,14 @@ class INetEngine {
 INetEngine *create_engine();
 
 } // namespace io
+
+// Platform helpers shared across backends
+namespace io {
+// Suppress SIGPIPE for the current process (POSIX). Safe to call multiple times.
+void suppress_sigpipe_once();
+
+// Diagnostics: count of broken pipes (EPIPE/ECONNRESET on write)
+void record_broken_pipe();
+uint64_t broken_pipe_count();
+void reset_broken_pipe_count();
+}

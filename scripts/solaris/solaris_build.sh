@@ -9,7 +9,7 @@ else
   source scripts/solaris/.env.example
 fi
 
-ssh -tt -p "${SOLARIS_SSH_PORT}" ${SOLARIS_SSH_OPTS} "${SOLARIS_SSH}" bash -s -- \
+ssh -p "${SOLARIS_SSH_PORT}" ${SOLARIS_SSH_OPTS} "${SOLARIS_SSH}" bash -s -- \
   "${SOLARIS_DIR}" \
   "${SOLARIS_BUILD}" \
   "${SOLARIS_CMAKE}" \
