@@ -10,8 +10,8 @@ on:
 
 jobs:
   windows-msys2:
-    # Match your runner labels. Keep it generic to avoid arch mismatch.
-    runs-on: [ self-hosted, Windows ]
+    # Match your runner labels: use your custom label ANYKS
+    runs-on: [ self-hosted, ANYKS ]
     steps:
       - uses: actions/checkout@v4
 
