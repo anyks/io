@@ -5,6 +5,12 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: CMake preset (debug, asan, etc.)
+        default: debug
+        required: false
 
 jobs:
   linux:

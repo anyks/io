@@ -5,6 +5,11 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: Optional CMake preset override (debug, asan, tsan, ubsan)
+        required: false
 
 jobs:
   linux-debug:
