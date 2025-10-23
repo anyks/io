@@ -31,6 +31,17 @@ jobs:
           set +e
           find build -type f -path "*/stress/*.log" -print -exec sh -c 'echo "==== {} ====\n"; tail -n 200 "{}"' \; || true
           find build -type f -path "*/Testing/Temporary/LastTest.log" -print -exec sh -c 'echo "==== {} ====\n"; tail -n 200 "{}"' \; || true
+          echo "=== Listing available stress and test files ==="
+          find build -type d -name stress -print -exec sh -c 'ls -la {}' \;
+          find build -type d -path "*/Testing/Temporary" -print -exec sh -c 'ls -la {}' \;
+      - name: Upload test logs on failure (Linux)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-logs-extra
+          path: |
+            build/**/Testing/Temporary/LastTest.log
+            build/**/Testing/**/Test.xml
       - name: Upload stress logs (Linux)
         if: always()
         uses: actions/upload-artifact@v4
@@ -39,6 +50,7 @@ jobs:
           path: |
             build/**/stress/*.log
             build/**/stress/parallel_*.log
+            build/**/stress/**.log
 
   macos:
     runs-on: macos-latest
@@ -64,6 +76,17 @@ jobs:
           set +e
           find build -type f -path "*/stress/*.log" -print -exec sh -c 'echo "==== {} ====\n"; tail -n 200 "{}"' \; || true
           find build -type f -path "*/Testing/Temporary/LastTest.log" -print -exec sh -c 'echo "==== {} ====\n"; tail -n 200 "{}"' \; || true
+          echo "=== Listing available stress and test files ==="
+          find build -type d -name stress -print -exec sh -c 'ls -la {}' \;
+          find build -type d -path "*/Testing/Temporary" -print -exec sh -c 'ls -la {}' \;
+      - name: Upload test logs on failure (macOS)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-test-logs-extra
+          path: |
+            build/**/Testing/Temporary/LastTest.log
+            build/**/Testing/**/Test.xml
       - name: Upload stress logs (macOS)
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,3 +95,4 @@ jobs:
           path: |
             build/**/stress/*.log
             build/**/stress/parallel_*.log
+            build/**/stress/**.log
