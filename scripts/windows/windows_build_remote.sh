@@ -14,7 +14,11 @@ fi
 WIN_HOST=${WIN_HOST:-}
 WIN_USER=${WIN_USER:-}
 WIN_PORT=${WIN_PORT:-22}
-REMOTE_DIR=${WIN_REPO:-/e/io/src}
+if [[ "${WIN_REPO:-}" == /Users/* ]]; then
+  REMOTE_DIR=/e/io/src
+else
+  REMOTE_DIR=${WIN_REPO:-/e/io/src}
+fi
 CONFIG=${1:-${CONFIG:-Debug}}
 BUILD_TIMEOUT=${BUILD_TIMEOUT:-900}
 
