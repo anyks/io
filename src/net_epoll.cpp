@@ -693,12 +693,14 @@ class EpollEngine : public INetEngine {
 		return true;
 	}
 	bool post(uint32_t /*val*/) override {
-		// Count logical event and best-effort wake with a single byte to avoid pipe overflow
+		// Считаем логическое событие и будим epoll только при переходе 0 -> 1,
+		// чтобы исключить переполнение канала при массовых post(M).
 		stats_.user_events.fetch_add(1, std::memory_order_relaxed);
-		user_pending_.fetch_add(1, std::memory_order_relaxed);
-		if (user_pipe_[1] == -1) return true;
-		uint8_t b = 1;
-		(void)::write(user_pipe_[1], &b, sizeof(b)); // ignore EAGAIN
+		uint64_t prev = user_pending_.fetch_add(1, std::memory_order_acq_rel);
+		if (prev == 0 && user_pipe_[1] != -1) {
+			uint8_t b = 1;
+			(void)::write(user_pipe_[1], &b, sizeof(b)); // best-effort, игнорируем EAGAIN
+		}
 		return true;
 	}
 	bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
