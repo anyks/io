@@ -1,6 +1,10 @@
 name: Solaris (remote over SSH)
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       eventports:
