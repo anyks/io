@@ -1,0 +1,44 @@
+name: POSIX Stress Matrix
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build liburing-dev cmake g++
+      - name: Run stress matrix (Linux)
+        env:
+          IO_STRESS_N: "300"
+          IO_STRESS_M: "20000"
+          GENERATOR: Ninja
+          PRESET: debug
+        run: |
+          bash scripts/stress_matrix.sh Debug
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          brew update
+          brew install ninja cmake || true
+      - name: Run stress matrix (macOS)
+        env:
+          IO_STRESS_N: "300"
+          IO_STRESS_M: "20000"
+          GENERATOR: Ninja
+          PRESET: debug
+        run: |
+          bash scripts/stress_matrix.sh Debug
