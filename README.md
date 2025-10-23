@@ -371,37 +371,37 @@ ctest --test-dir ./build/tsan -R NetHighload.ManyClientsEchoNoBlock --repeat-unt
 	- Для подробных логов используйте Debug-конфигурацию. Для включения логов в Release см. раздел про расширенное логирование.
 	- Если запускаете в WSL — используйте Linux-сборку (epoll/io_uring); нативный IOCP доступен только в Windows.
 
-### Быстрая локальная сборка (MSYS2 MinGW64, x86_64)
+### Быстрая локальная сборка (MSYS2 MinGW64, x86_64, bash)
 
-Если у вас установлен MSYS2 в `C:\msys64`, можно собрать библиотеку и примеры одним скриптом (тесты временно выключены):
+Если у вас установлен MSYS2 и вы заходите по SSH сразу в bash (MSYS2 MinGW64), используйте обычные bash‑скрипты — всё как на Linux:
 
-```bat
-scripts\windows\msys2\build.bat Debug
+```bash
+./scripts/windows/msys2/build.sh Debug
 ```
 
-- По умолчанию сборка попадёт в `E:\io`. Изменить путь можно отредактировав `BUILD_WIN` внутри скрипта.
-- Скрипт автоматически выберет генератор: Ninja (если установлен) или MinGW Makefiles.
-- Для Release: `scripts\windows\msys2\build.bat Release`.
-- Если чего-то не хватает в MSYS2, установите в профиле "MSYS2 MinGW x64":
-  - `pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja`
+- По умолчанию вывод в `/e/io` (то есть `E:\io`). Переопределить можно переменной окружения `BUILD_WIN=/path`.
+- Генератор выбирается автоматически: Ninja (если есть в PATH) или "MinGW Makefiles".
+- Для Release: `./scripts/windows/msys2/build.sh Release`.
+- Убедитесь, что установлены пакеты в MSYS2 MinGW64:
+	- `pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja`
 
-Примечание: Windows job в GitHub Actions для MSYS2/self-hosted существует, но его можно игнорировать — локальная отладка обычно быстрее и удобнее.
+Примечание: Windows job в GitHub Actions можно игнорировать — локальная отладка через MSYS2 обычно быстрее.
 
-Примечание: GitHub Actions для Windows временно отключён; бэкенд доступен и собирается локально по инструкции выше.
+#### Авто‑сборка по новым коммитам (bash‑watcher)
 
-#### Авто‑сборка по новым коммитам (watcher)
+Чтобы не запускать сборку вручную, включите bash‑вотчер: каждые 15 секунд он подтягивает `origin/main` и при изменениях делает `reset --hard` и пересборку (в `/e/io`). Запустите:
 
-Чтобы не запускать сборку вручную, можно включить простой вотчер, который каждые 15 секунд подтягивает `origin/main` и при изменениях делает `reset --hard` и пересборку (в `E:\io`). Запустите один раз:
-
-```bat
-scripts\windows\msys2\watch_build.bat
+```bash
+./scripts/windows/msys2/watch_build.sh
 ```
 
 Требования:
-- установлен Git в PATH (Windows);
-- MSYS2 в `C:\msys64` с пакетами toolchain/cmake/ninja (см. выше).
+- Git в PATH;
+- MSYS2 MinGW64 с пакетами toolchain/cmake/ninja (см. выше).
 
 Замечание: вотчер выполняет `git reset --hard origin/main` — локальные незакоммиченные изменения будут потеряны.
+
+Альтернатива (если у вас cmd по умолчанию): доступны эквивалентные .bat‑скрипты `scripts\windows\msys2\build.bat` и `watch_build.bat`.
 
 ## Заметки для Solaris (event ports/devpoll)
 
