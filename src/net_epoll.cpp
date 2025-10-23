@@ -95,7 +95,13 @@ class EpollEngine : public INetEngine {
 			}
 			// user pipe
 			if ((events & EPOLLIN) && fd == user_pipe_[0]) {
-				uint32_t v; while (::read(user_pipe_[0], &v, sizeof(v)) == sizeof(v)) { if (cbs_.on_user) cbs_.on_user(v); }
+				// Drain the pipe (edge-triggered wake) and deliver all pending logical user events
+				uint8_t tmp[256];
+				while (::read(user_pipe_[0], tmp, sizeof(tmp)) > 0) {}
+				uint64_t cnt = user_pending_.exchange(0, std::memory_order_relaxed);
+				for (uint64_t k = 0; k < cnt; ++k) {
+					if (cbs_.on_user) cbs_.on_user(0);
+				}
 				continue;
 			}
 			bool is_listener = (listeners_.find(fd) != listeners_.end());
@@ -246,7 +252,12 @@ class EpollEngine : public INetEngine {
 			}
 			// user pipe events
 			if ((events & EPOLLIN) && fd == user_pipe_[0]) {
-				uint32_t v; while (::read(user_pipe_[0], &v, sizeof(v)) == sizeof(v)) { if (cbs_.on_user) cbs_.on_user(v); }
+				uint8_t tmp[256];
+				while (::read(user_pipe_[0], tmp, sizeof(tmp)) > 0) {}
+				uint64_t cnt = user_pending_.exchange(0, std::memory_order_relaxed);
+				for (uint64_t k = 0; k < cnt; ++k) {
+					if (cbs_.on_user) cbs_.on_user(0);
+				}
 				continue;
 			}
 			bool is_listener = (listeners_.find(fd) != listeners_.end());
@@ -681,12 +692,14 @@ class EpollEngine : public INetEngine {
 		}
 		return true;
 	}
-	bool post(uint32_t val) override {
-		if (user_pipe_[1] == -1)
-			return false;
-		ssize_t n = ::write(user_pipe_[1], &val, sizeof(val));
-		if (n == (ssize_t)sizeof(val)) stats_.user_events.fetch_add(1, std::memory_order_relaxed);
-		return n == (ssize_t)sizeof(val);
+	bool post(uint32_t /*val*/) override {
+		// Count logical event and best-effort wake with a single byte to avoid pipe overflow
+		stats_.user_events.fetch_add(1, std::memory_order_relaxed);
+		user_pending_.fetch_add(1, std::memory_order_relaxed);
+		if (user_pipe_[1] == -1) return true;
+		uint8_t b = 1;
+		(void)::write(user_pipe_[1], &b, sizeof(b)); // ignore EAGAIN
+		return true;
 	}
 	bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
 		// Create or update a timerfd for this socket
@@ -797,6 +810,7 @@ class EpollEngine : public INetEngine {
 	int ep_{-1};
 	NetCallbacks cbs_{};
 	int user_pipe_[2]{-1, -1};
+	std::atomic<uint64_t> user_pending_{0};
 
 	std::unordered_map<socket_t, SockState> sockets_;
 	std::unordered_set<socket_t> listeners_;
