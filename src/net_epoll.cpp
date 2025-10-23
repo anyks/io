@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
+#include <mutex>
 #include <vector>
 
 // Logging macros: errors in Debug, debug gated by IO_ENABLE_EPOLL_VERBOSE
@@ -95,12 +97,16 @@ class EpollEngine : public INetEngine {
 			}
 			// user pipe
 			if ((events & EPOLLIN) && fd == user_pipe_[0]) {
-				// Drain the pipe (edge-triggered wake) and deliver all pending logical user events
+				// Drain the pipe (edge-triggered) and deliver queued user values
 				uint8_t tmp[256];
 				while (::read(user_pipe_[0], tmp, sizeof(tmp)) > 0) {}
-				uint64_t cnt = user_pending_.exchange(0, std::memory_order_relaxed);
-				for (uint64_t k = 0; k < cnt; ++k) {
-					if (cbs_.on_user) cbs_.on_user(0);
+				std::deque<uint32_t> pending;
+				{
+					std::lock_guard<std::mutex> lk(user_mtx_);
+					pending.swap(user_vals_);
+				}
+				for (auto v : pending) {
+					if (cbs_.on_user) cbs_.on_user(v);
 				}
 				continue;
 			}
@@ -254,9 +260,13 @@ class EpollEngine : public INetEngine {
 			if ((events & EPOLLIN) && fd == user_pipe_[0]) {
 				uint8_t tmp[256];
 				while (::read(user_pipe_[0], tmp, sizeof(tmp)) > 0) {}
-				uint64_t cnt = user_pending_.exchange(0, std::memory_order_relaxed);
-				for (uint64_t k = 0; k < cnt; ++k) {
-					if (cbs_.on_user) cbs_.on_user(0);
+				std::deque<uint32_t> pending;
+				{
+					std::lock_guard<std::mutex> lk(user_mtx_);
+					pending.swap(user_vals_);
+				}
+				for (auto v : pending) {
+					if (cbs_.on_user) cbs_.on_user(v);
 				}
 				continue;
 			}
@@ -692,14 +702,18 @@ class EpollEngine : public INetEngine {
 		}
 		return true;
 	}
-	bool post(uint32_t /*val*/) override {
-		// Считаем логическое событие и будим epoll только при переходе 0 -> 1,
-		// чтобы исключить переполнение канала при массовых post(M).
+	bool post(uint32_t val) override {
+		// Очередь значений + одиночная будилка при переходе из пустого состояния.
 		stats_.user_events.fetch_add(1, std::memory_order_relaxed);
-		uint64_t prev = user_pending_.fetch_add(1, std::memory_order_acq_rel);
-		if (prev == 0 && user_pipe_[1] != -1) {
+		bool need_wake = false;
+		{
+			std::lock_guard<std::mutex> lk(user_mtx_);
+			need_wake = user_vals_.empty();
+			user_vals_.push_back(val);
+		}
+		if (need_wake && user_pipe_[1] != -1) {
 			uint8_t b = 1;
-			(void)::write(user_pipe_[1], &b, sizeof(b)); // best-effort, игнорируем EAGAIN
+			(void)::write(user_pipe_[1], &b, sizeof(b));
 		}
 		return true;
 	}
@@ -812,7 +826,8 @@ class EpollEngine : public INetEngine {
 	int ep_{-1};
 	NetCallbacks cbs_{};
 	int user_pipe_[2]{-1, -1};
-	std::atomic<uint64_t> user_pending_{0};
+	std::mutex user_mtx_;
+	std::deque<uint32_t> user_vals_;
 
 	std::unordered_map<socket_t, SockState> sockets_;
 	std::unordered_set<socket_t> listeners_;
