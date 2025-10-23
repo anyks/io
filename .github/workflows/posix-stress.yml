@@ -24,6 +24,13 @@ jobs:
           PRESET: debug
         run: |
           bash scripts/stress_matrix.sh Debug
+      - name: Dump stress logs on failure (Linux)
+        if: failure()
+        run: |
+          echo "=== Dumping stress logs (last 200 lines) ==="
+          set +e
+          find build -type f -path "*/stress/*.log" -print -exec sh -c 'echo "==== {} ====\n"; tail -n 200 "{}"' \; || true
+          find build -type f -path "*/Testing/Temporary/LastTest.log" -print -exec sh -c 'echo "==== {} ====\n"; tail -n 200 "{}"' \; || true
       - name: Upload stress logs (Linux)
         if: always()
         uses: actions/upload-artifact@v4
@@ -50,6 +57,13 @@ jobs:
           PRESET: debug
         run: |
           bash scripts/stress_matrix.sh Debug
+      - name: Dump stress logs on failure (macOS)
+        if: failure()
+        run: |
+          echo "=== Dumping stress logs (last 200 lines) ==="
+          set +e
+          find build -type f -path "*/stress/*.log" -print -exec sh -c 'echo "==== {} ====\n"; tail -n 200 "{}"' \; || true
+          find build -type f -path "*/Testing/Temporary/LastTest.log" -print -exec sh -c 'echo "==== {} ====\n"; tail -n 200 "{}"' \; || true
       - name: Upload stress logs (macOS)
         if: always()
         uses: actions/upload-artifact@v4
