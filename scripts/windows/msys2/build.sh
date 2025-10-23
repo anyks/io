@@ -14,6 +14,7 @@ fi
 
 CONFIG=${1:-${CONFIG:-Debug}}
 BUILD_WIN=${BUILD_WIN:-/e/io}
+BUILD_TIMEOUT=${BUILD_TIMEOUT:-900} # seconds (15 min default)
 GEN="Ninja"
 
 if ! command -v cmake >/dev/null 2>&1; then
@@ -37,12 +38,36 @@ echo "[io][build] CONFIG=$CONFIG"
 echo "[io][build] BUILD_WIN=$BUILD_WIN"
 printf "[io][build] Generator: %s\n" "$GEN"
 
-echo "[io][build] CMake configure..."
-cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G "$GEN" \
-  -DCMAKE_BUILD_TYPE="${CONFIG}" \
-  -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON
+echo "[io][build] CMake configure (timeout: ${BUILD_TIMEOUT}s)..."
+if command -v timeout >/dev/null 2>&1; then
+  timeout -k 10s "${BUILD_TIMEOUT}s" \
+    cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G "$GEN" \
+      -DCMAKE_BUILD_TYPE="${CONFIG}" \
+      -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON || {
+        code=$?
+        if [[ $code -eq 124 ]]; then
+          echo "[io][build] Configure timed out after ${BUILD_TIMEOUT}s" >&2
+        fi
+        exit $code
+      }
+else
+  echo "[io][build] WARN: coreutils timeout not found; running without a hard limit" >&2
+  cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G "$GEN" \
+    -DCMAKE_BUILD_TYPE="${CONFIG}" \
+    -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON
+fi
 
-echo "[io][build] Build..."
-cmake --build "$BUILD_DIR" -j
+echo "[io][build] Build (timeout: ${BUILD_TIMEOUT}s)..."
+if command -v timeout >/dev/null 2>&1; then
+  timeout -k 10s "${BUILD_TIMEOUT}s" cmake --build "$BUILD_DIR" -j || {
+    code=$?
+    if [[ $code -eq 124 ]]; then
+      echo "[io][build] Build timed out after ${BUILD_TIMEOUT}s" >&2
+    fi
+    exit $code
+  }
+else
+  cmake --build "$BUILD_DIR" -j
+fi
 
 echo "[io][build] Done. Outputs in: $BUILD_DIR"

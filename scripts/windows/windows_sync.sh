@@ -14,13 +14,19 @@ fi
 WIN_HOST=${WIN_HOST:-}
 WIN_USER=${WIN_USER:-}
 WIN_PORT=${WIN_PORT:-22}
-REMOTE_DIR=${WIN_REPO:-/e/io/src}
+# Heuristic: if WIN_REPO looks like a macOS path (/Users/...), ignore and fallback
+if [[ "${WIN_REPO:-}" == /Users/* ]]; then
+  REMOTE_DIR=/e/io/src
+else
+  REMOTE_DIR=${WIN_REPO:-/e/io/src}
+fi
 
 if [[ -z "$WIN_HOST" || -z "$WIN_USER" ]]; then
   echo "[windows_sync] Please set WIN_HOST and WIN_USER in $ENV_FILE" >&2
   exit 1
 fi
 
+SSH_OPTS=(-o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
 echo "[windows_sync] Target: $WIN_USER@$WIN_HOST:$WIN_PORT"
 echo "[windows_sync] Remote repo dir: $REMOTE_DIR"
 
@@ -28,13 +34,12 @@ cd "$ROOT_DIR"
 
 # Create remote dir and extract archive there
 create_and_extract() {
-  ssh -p "$WIN_PORT" "$WIN_USER@$WIN_HOST" \
-    "mkdir -p '$REMOTE_DIR' && tar xzf - -C '$REMOTE_DIR'"
+  ssh "${SSH_OPTS[@]}" -p "$WIN_PORT" "$WIN_USER@$WIN_HOST" \
+    "C:/msys64/usr/bin/bash.exe -lc 'mkdir -p \"$REMOTE_DIR\" && tar xzf - -C \"$REMOTE_DIR\"'"
 }
 
 echo "[windows_sync] Creating archive and transferring..."
-tar --exclude './.git' \
-    --exclude './build' \
+tar --exclude './build' \
     --exclude './build/*' \
     --exclude './_install' \
     --exclude './_CPack_Packages' \
