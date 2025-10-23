@@ -1,0 +1,82 @@
+name: Solaris (remote over SSH)
+
+on:
+  workflow_dispatch:
+    inputs:
+      eventports:
+        description: Build/test Event Ports first (ON) then /dev/poll (OFF)
+        required: false
+        default: 'true'
+
+jobs:
+  solaris-ssh:
+    runs-on: ubuntu-latest
+    # Use environment-scoped secrets. Create an Environment named "solaris"
+    # in Repository Settings -> Environments, and add secrets there:
+    #  - SSH_KEY, SSH, SSH_PORT, SSH_DIR
+    environment: solaris
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rsync and ssh tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-client
+
+      - name: Prepare SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          # Optional: pre-populate known_hosts to avoid prompts
+          if [ -n "${{ vars.SSH_HOST }}" ]; then
+            ssh-keyscan -p "${{ vars.SSH_PORT }}" "${{ vars.SSH_HOST }}" >> ~/.ssh/known_hosts || true
+          fi
+
+      - name: Create scripts/solaris/.env
+        run: |
+          cat > scripts/solaris/.env << 'EOF'
+          SOLARIS_SSH=${{ secrets.SSH }}
+          SOLARIS_SSH_PORT=${{ secrets.SSH_PORT }}
+          SOLARIS_DIR=${{ secrets.SSH_DIR }}
+          SOLARIS_BUILD=build/sol
+          SOLARIS_SSH_OPTS=-o StrictHostKeyChecking=no -i ~/.ssh/id_rsa
+          SOLARIS_EVENTPORTS=ON
+          EOF
+          sed -n '1,200p' scripts/solaris/.env
+
+      - name: Sync sources
+        run: bash scripts/solaris/solaris_sync.sh
+
+      - name: Configure (Event Ports)
+        if: ${{ inputs.eventports == 'true' }}
+        run: bash scripts/solaris/solaris_configure.sh
+
+      - name: Build (Event Ports)
+        if: ${{ inputs.eventports == 'true' }}
+        run: bash scripts/solaris/solaris_build.sh
+
+      - name: Test (Event Ports)
+        if: ${{ inputs.eventports == 'true' }}
+        run: bash scripts/solaris/solaris_test.sh
+
+      - name: Parallel + Stress (Event Ports)
+        if: ${{ inputs.eventports == 'true' }}
+        run: bash scripts/solaris/solaris_parallel_and_stress.sh 4 200
+
+      - name: Configure (/dev/poll)
+        run: |
+          # Flip Event Ports OFF and reconfigure
+          sed -i 's/^SOLARIS_EVENTPORTS=.*/SOLARIS_EVENTPORTS=OFF/' scripts/solaris/.env
+          bash scripts/solaris/solaris_configure.sh
+
+      - name: Build (/dev/poll)
+        run: bash scripts/solaris/solaris_build.sh
+
+      - name: Test (/dev/poll)
+        run: bash scripts/solaris/solaris_test.sh
+
+      - name: Parallel + Stress (/dev/poll)
+        run: bash scripts/solaris/solaris_parallel_and_stress.sh 4 200

@@ -389,6 +389,20 @@ scripts\windows\msys2\build.bat Debug
 
 Примечание: GitHub Actions для Windows временно отключён; бэкенд доступен и собирается локально по инструкции выше.
 
+#### Авто‑сборка по новым коммитам (watcher)
+
+Чтобы не запускать сборку вручную, можно включить простой вотчер, который каждые 15 секунд подтягивает `origin/main` и при изменениях делает `reset --hard` и пересборку (в `E:\io`). Запустите один раз:
+
+```bat
+scripts\windows\msys2\watch_build.bat
+```
+
+Требования:
+- установлен Git в PATH (Windows);
+- MSYS2 в `C:\msys64` с пакетами toolchain/cmake/ninja (см. выше).
+
+Замечание: вотчер выполняет `git reset --hard origin/main` — локальные незакоммиченные изменения будут потеряны.
+
 ## Заметки для Solaris (event ports/devpoll)
 
 - По умолчанию используется Event Ports (`IO_WITH_EVENTPORTS=ON`). Переключение на `/dev/poll`: `-DIO_WITH_EVENTPORTS=OFF`.

@@ -1,0 +1,37 @@
+name: Solaris (self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      eventports:
+        description: Build with Event Ports (ON) and /dev/poll (OFF)
+        required: false
+        default: 'true'
+
+jobs:
+  solaris-build-test:
+    # Requires a self-hosted runner registered with the label 'solaris'
+    runs-on: [ self-hosted, solaris ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Event Ports)
+        if: ${{ inputs.eventports == 'true' }}
+        run: cmake -S . -B build/sol -DCMAKE_BUILD_TYPE=Debug -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON -DIO_WITH_EVENTPORTS=ON
+
+      - name: Build (Event Ports)
+        if: ${{ inputs.eventports == 'true' }}
+        run: cmake --build build/sol -j
+
+      - name: Test (Event Ports)
+        if: ${{ inputs.eventports == 'true' }}
+        run: ctest --test-dir build/sol --output-on-failure
+
+      - name: Configure (/dev/poll)
+        run: cmake -S . -B build/sol-dp -DCMAKE_BUILD_TYPE=Debug -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON -DIO_WITH_EVENTPORTS=OFF
+
+      - name: Build (/dev/poll)
+        run: cmake --build build/sol-dp -j
+
+      - name: Test (/dev/poll)
+        run: ctest --test-dir build/sol-dp --output-on-failure
