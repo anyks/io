@@ -1,42 +1,39 @@
 #include "io/net.hpp"
 #if defined(IO_ENGINE_IOURING)
 #include <arpa/inet.h>
-#include <atomic>
-#include <cerrno>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <cstdlib>
-#include <deque>
-#include <fcntl.h>
-#include <liburing.h>
-#include <limits>
-#include <mutex>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/eventfd.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
-
-// Logging macros: errors in Debug, debug gated by IO_ENABLE_IOURING_VERBOSE
-#ifndef NDEBUG
-#define IO_LOG_ERR(...)                                                                                                 \
-	do {                                                                                                                \
-		std::fprintf(stderr, "[io/iouring][ERR] ");                                                                    \
-		std::fprintf(stderr, __VA_ARGS__);                                                                              \
-		std::fprintf(stderr, "\n");                                                                                     \
-	} while (0)
-#else
-#define IO_LOG_ERR(...) ((void)0)
-#endif
-
+							if (res >= 0) {
+								int err = 0;
+								socklen_t len = sizeof(err);
+								int gs = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+								if (gs < 0) {
+									int e = errno;
+									IO_LOG_ERR("getsockopt(SO_ERROR fd=%d) failed errno=%d (%s)", (int)fd, e, std::strerror(e));
+									err = e;
+								} else {
+									IO_LOG_DBG("connect completion fd=%d, SO_ERROR=%d (%s)", (int)fd, err, std::strerror(err));
+								}
+								if (err == 0) {
+									IO_LOG_DBG("connect: established fd=%d", (int)fd);
+									stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
+									if (cbs_.on_accept) { IO_LOG_DBG("invoke on_accept(client) fd=%d", (int)fd); cbs_.on_accept(fd);} 
+									submit_recv(fd);
+								} else {
+									if (cbs_.on_close)
+										cbs_.on_close(fd);
+									::close(fd);
+									sockets_.erase(fd);
+									stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
+								}
+							} else {
+								if (cbs_.on_close)
+									cbs_.on_close(fd);
+								::close(fd);
+								sockets_.erase(fd);
+							}
 #ifdef IO_ENABLE_IOURING_VERBOSE
 #define IO_LOG_DBG(...)                                                                                                 \
 	do {                                                                                                                \
-		std::fprintf(stderr, "[io/iouring][DBG] ");                                                                    \
+							stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 		std::fprintf(stderr, __VA_ARGS__);                                                                              \
 		std::fprintf(stderr, "\n");                                                                                     \
 	} while (0)
@@ -983,6 +980,8 @@ INetEngine *create_engine_iouring() {
 
 } // namespace io
 
+namespace io {
+
 NetStats IouringEngine::get_stats() {
 	NetStats s{};
 	s.accepts_ok = stats_.accepts_ok.load(std::memory_order_relaxed);
@@ -1027,5 +1026,7 @@ void IouringEngine::reset_stats() {
 	stats_.send_dequeued_bytes.store(0, std::memory_order_relaxed);
 	stats_.send_dropped_bytes.store(0, std::memory_order_relaxed);
 }
+
+} // namespace io
 
 #endif
