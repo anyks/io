@@ -4,11 +4,19 @@ set -euo pipefail
 # MSYS2 bash watcher: pull origin/main and rebuild on new commits
 # Usage: ./scripts/windows/msys2/watch_build.sh [Debug|Release]
 
-CONFIG=${1:-Debug}
+# Load env if present
+ROOT_DIR=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+ENV_FILE="$ROOT_DIR/scripts/windows/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+
+CONFIG=${1:-${CONFIG:-Debug}}
 INTERVAL=${INTERVAL:-15}
 BUILD_WIN=${BUILD_WIN:-/e/io}
 
-cd "$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
 
 echo "[io][watch] Start watcher: interval=${INTERVAL}s, config=${CONFIG}, build_root=${BUILD_WIN}"
 

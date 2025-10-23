@@ -4,7 +4,15 @@ set -euo pipefail
 # One-click MSYS2 MinGW64 build of io using bash (SSH-friendly)
 # Usage: ./scripts/windows/msys2/build.sh [Debug|Release]  (default: Debug)
 
-CONFIG=${1:-Debug}
+# Load env if present
+ROOT_DIR=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+ENV_FILE="$ROOT_DIR/scripts/windows/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+
+CONFIG=${1:-${CONFIG:-Debug}}
 BUILD_WIN=${BUILD_WIN:-/e/io}
 GEN="Ninja"
 
@@ -30,7 +38,7 @@ echo "[io][build] BUILD_WIN=$BUILD_WIN"
 printf "[io][build] Generator: %s\n" "$GEN"
 
 echo "[io][build] CMake configure..."
-cmake -S . -B "$BUILD_DIR" -G "$GEN" \
+cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G "$GEN" \
   -DCMAKE_BUILD_TYPE="${CONFIG}" \
   -DIO_BUILD_TESTS=ON -DIO_BUILD_EXAMPLES=ON
 

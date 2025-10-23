@@ -403,6 +403,14 @@ ctest --test-dir ./build/tsan -R NetHighload.ManyClientsEchoNoBlock --repeat-unt
 
 Альтернатива (если у вас cmd по умолчанию): доступны эквивалентные .bat‑скрипты `scripts\windows\msys2\build.bat` и `watch_build.bat`.
 
+Конфигурация через .env
+- Все bash‑скрипты читают `scripts/windows/.env`, если он существует. Можно задавать:
+	- `CONFIG=Debug|Release`
+	- `BUILD_WIN=/e/io` (куда класть сборку)
+	- `INTERVAL=15` (период опроса вотчера)
+	- `WIN_HOST/WIN_PORT/WIN_USER/WIN_REPO` — справочная информация для своих удалённых сценариев
+- Пример файла уже в репозитории: `scripts/windows/.env` — отредактируйте под себя.
+
 ## Заметки для Solaris (event ports/devpoll)
 
 - По умолчанию используется Event Ports (`IO_WITH_EVENTPORTS=ON`). Переключение на `/dev/poll`: `-DIO_WITH_EVENTPORTS=OFF`.
