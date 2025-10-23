@@ -38,6 +38,38 @@ struct AcceptAutotuneConfig {
 	bool aggressive_cancel_on_downscale{true};
 };
 
+// Унифицированные метрики сетевого движка. Не все бэкенды могут
+// заполнять все поля; в таком случае значения останутся нулевыми.
+struct NetStats {
+	// Счетчики событий
+	uint64_t accepts_ok{0};
+	uint64_t accepts_fail{0};
+	uint64_t connects_ok{0};
+	uint64_t connects_fail{0};
+	uint64_t reads{0};
+	uint64_t bytes_read{0};
+	uint64_t writes{0};
+	uint64_t bytes_written{0};
+	uint64_t closes{0};
+	uint64_t timeouts{0};
+	uint64_t gqcs_errors{0}; // ошибки ожидания (актуально для IOCP)
+	uint64_t user_events{0}; // post() событий отправлено
+	uint64_t wakes_posted{0};
+	uint64_t autotune_up{0};   // увеличение глубины accept (IOCP)
+	uint64_t autotune_down{0}; // уменьшение глубины accept (IOCP)
+
+	// Гейджи (снимок на момент запроса)
+	uint64_t current_connections{0};
+	uint64_t peak_connections{0};
+	uint64_t outstanding_accepts{0}; // суммарное число висящих AcceptEx (IOCP)
+
+	// Очереди отправки (глобально)
+	uint64_t send_enqueued_bytes{0};
+	uint64_t send_dequeued_bytes{0};
+	uint64_t send_backlog_bytes{0}; // производное: enqueued - dequeued
+	uint64_t send_dropped_bytes{0}; // байты, потерянные при закрытии до отправки
+};
+
 class INetEngine {
   public:
 	virtual ~INetEngine() = default;
@@ -123,6 +155,11 @@ class INetEngine {
 	// Авто-тюнинг глубины AcceptEx по темпам входящих соединений (только IOCP).
 	// Повторные вызовы обновляют конфигурацию. Если cfg.enabled=false — авто-тюнинг отключается.
 	virtual bool set_accept_autotune(socket_t listen_socket, const AcceptAutotuneConfig &cfg) = 0;
+
+	// Метрики: по умолчанию возвращаются нули, если бэкенд не переопределил методы
+	// Реализации должны быть lock-free или недорогими; допускается атомарное чтение счётчиков.
+	virtual NetStats get_stats() { return NetStats{}; }
+	virtual void reset_stats() {}
 protected:
 	// Флаг выполнения цикла start/stop по умолчанию.
 	std::atomic<bool> loop_running_{false};

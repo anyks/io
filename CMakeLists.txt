@@ -13,6 +13,7 @@ option(IO_BUILD_TESTS "Build tests" ON)
 option(IO_BUILD_EXAMPLES "Build examples" ON)
 option(IO_WITH_IOURING "Use io_uring on Linux" OFF)
 option(IO_WITH_EVENTPORTS "Use Event Ports on Solaris" ON)
+option(IO_WITH_IOCP_WIN "Use IOCP backend on Windows (real implementation)" ON)
 option(IO_MAX_CONNECTIONS "Max simultaneous connections (0=unlimited)" 0)
 option(IO_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(IO_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
@@ -84,12 +85,19 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(io PRIVATE src/net_epoll.cpp)
   endif()
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  target_compile_definitions(io PUBLIC IO_ENGINE_IOCP)
-  target_sources(io PRIVATE src/net_iocp.cpp)
+  if (IO_WITH_IOCP_WIN)
+    target_compile_definitions(io PUBLIC IO_ENGINE_IOCP)
+    target_sources(io PRIVATE src/net_iocp.cpp)
+    # Use a numeric cache variable for accept depth (not a boolean option)
+    set(IO_IOCP_ACCEPT_DEPTH 4 CACHE STRING "Concurrent AcceptEx operations depth")
+    target_compile_definitions(io PUBLIC IOCP_ACCEPT_DEPTH=${IO_IOCP_ACCEPT_DEPTH})
+  else()
+    message(STATUS "Windows: IOCP disabled via IO_WITH_IOCP_WIN=OFF; using stub backend")
+    target_compile_definitions(io PUBLIC IO_ENGINE_IOCP)
+    target_sources(io PRIVATE src/net_iocp_stub.cpp)
+  endif()
+  # Winsock linking is required on Windows for both the library and consumers
   target_link_libraries(io PRIVATE ws2_32 Mswsock)
-  # Use a numeric cache variable for accept depth (not a boolean option)
-  set(IO_IOCP_ACCEPT_DEPTH 4 CACHE STRING "Concurrent AcceptEx operations depth")
-  target_compile_definitions(io PUBLIC IOCP_ACCEPT_DEPTH=${IO_IOCP_ACCEPT_DEPTH})
 elseif (CMAKE_SYSTEM_NAME STREQUAL "SunOS")
   if (IO_WITH_EVENTPORTS)
     target_compile_definitions(io PUBLIC IO_ENGINE_EVENTPORTS)
@@ -138,7 +146,7 @@ if (IO_BUILD_EXAMPLES)
 
   add_executable(example_client examples/client.cpp)
   target_link_libraries(example_client PRIVATE io)
-  if (MSVC)
+  if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(io_example PRIVATE ws2_32 Mswsock)
     target_link_libraries(example_server PRIVATE ws2_32 Mswsock)
     target_link_libraries(example_client PRIVATE ws2_32 Mswsock)
@@ -156,10 +164,23 @@ if (IO_BUILD_TESTS)
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
   enable_testing()
-  if (MSVC)
-    # On Windows (MSVC), build only portable tests that don't require POSIX sockets
-    add_executable(io_tests tests/io_tests.cpp)
+  if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    # On Windows, build portable tests and IOCP smoke/integration that work with MinGW and MSVC
+    add_executable(io_tests
+      tests/io_tests.cpp
+      tests/io_win_user_event_tests.cpp
+      tests/io_win_accept_rw_tests.cpp
+      tests/io_win_async_connect_tests.cpp
+      tests/io_win_read_timeout_tests.cpp
+      tests/io_win_pause_resume_tests.cpp
+      tests/io_win_metrics_tests.cpp
+      tests/io_win_iocp_stress.cpp
+    )
+    if (MSVC)
+      target_sources(io_tests PRIVATE tests/io_win_iocp_smoke.cpp tests/io_win_iocp_integration.cpp)
+    endif()
     target_link_libraries(io_tests PRIVATE io GTest::gtest_main)
+    target_link_libraries(io_tests PRIVATE ws2_32 Mswsock)
   else()
     add_executable(io_tests
       tests/io_tests.cpp
@@ -173,6 +194,7 @@ if (IO_BUILD_TESTS)
       tests/net_pause_multi_timeout_tests.cpp
       tests/net_write_closed_tests.cpp
       tests/net_egain_partial_write_tests.cpp
+      tests/io_linux_metrics_tests.cpp
     )
     target_link_libraries(io_tests PRIVATE io GTest::gtest_main)
   endif()

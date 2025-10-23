@@ -63,6 +63,34 @@
         "IO_BUILD_EXAMPLES": "ON",
         "IO_ENABLE_UBSAN": "ON"
       }
+    },
+    {
+      "name": "windows-msvc-vs-debug",
+      "displayName": "Windows MSVC (VS2022) Debug",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "build/windows-msvc-vs-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "IO_BUILD_TESTS": "ON",
+        "IO_BUILD_EXAMPLES": "ON"
+      },
+      "architecture": {
+        "value": "x64"
+      }
+    },
+    {
+      "name": "windows-msvc-vs-release",
+      "displayName": "Windows MSVC (VS2022) Release",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "build/windows-msvc-vs-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "IO_BUILD_TESTS": "ON",
+        "IO_BUILD_EXAMPLES": "ON"
+      },
+      "architecture": {
+        "value": "x64"
+      }
     }
   ],
   "buildPresets": [
@@ -70,13 +98,17 @@
     { "name": "release", "configurePreset": "release" },
     { "name": "asan", "configurePreset": "asan" },
     { "name": "tsan", "configurePreset": "tsan" },
-    { "name": "ubsan", "configurePreset": "ubsan" }
+    { "name": "ubsan", "configurePreset": "ubsan" },
+    { "name": "windows-msvc-vs-debug", "configurePreset": "windows-msvc-vs-debug" },
+    { "name": "windows-msvc-vs-release", "configurePreset": "windows-msvc-vs-release" }
   ],
   "testPresets": [
     { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
     { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
     { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
     { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } },
-    { "name": "ubsan", "configurePreset": "ubsan", "output": { "outputOnFailure": true } }
+    { "name": "ubsan", "configurePreset": "ubsan", "output": { "outputOnFailure": true } },
+    { "name": "windows-msvc-vs-debug", "configurePreset": "windows-msvc-vs-debug", "output": { "outputOnFailure": true } },
+    { "name": "windows-msvc-vs-release", "configurePreset": "windows-msvc-vs-release", "output": { "outputOnFailure": true } }
   ]
 }

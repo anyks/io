@@ -27,4 +27,4 @@ ssh "${SSH_OPTS[@]}" -p "$WIN_PORT" "$WIN_USER@$WIN_HOST" \
     mingw-w64-x86_64-toolchain \
     mingw-w64-x86_64-cmake \
     mingw-w64-x86_64-ninja \
-    mingw-w64-x86_64-coreutils; echo BOOTSTRAP_OK'"
+    coreutils; echo BOOTSTRAP_OK'"

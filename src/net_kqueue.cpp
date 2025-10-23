@@ -62,6 +62,10 @@ class KqueueEngine : public INetEngine {
 
 	bool loop_once(uint32_t timeout_ms) override;
 
+	// Метрики
+	NetStats get_stats() override;
+	void reset_stats() override;
+
 	bool init(const NetCallbacks &cbs) override;
 	void destroy() override;
 	bool add_socket(socket_t socket, char *buffer, size_t buffer_size, ReadCallback cb) override;
@@ -96,6 +100,7 @@ class KqueueEngine : public INetEngine {
 		if (user_pipe_[1] != -1) {
 			uint32_t v = 0;
 			(void)::write(user_pipe_[1], &v, sizeof(v));
+			stats_.wakes_posted.fetch_add(1, std::memory_order_relaxed);
 		}
 		struct kevent trig{};
 		EV_SET(&trig, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
@@ -121,6 +126,16 @@ class KqueueEngine : public INetEngine {
 	std::atomic<uint32_t> max_conn_{0};
 	std::atomic<uint32_t> cur_conn_{0};
 	std::deque<uint32_t> userq_;
+	struct StatsAtomic {
+		std::atomic<uint64_t> accepts_ok{0}, accepts_fail{0};
+		std::atomic<uint64_t> connects_ok{0}, connects_fail{0};
+		std::atomic<uint64_t> reads{0}, bytes_read{0};
+		std::atomic<uint64_t> writes{0}, bytes_written{0};
+		std::atomic<uint64_t> closes{0}, timeouts{0};
+		std::atomic<uint64_t> user_events{0}, wakes_posted{0};
+		std::atomic<uint64_t> peak_connections{0};
+		std::atomic<uint64_t> send_enqueued_bytes{0}, send_dequeued_bytes{0}, send_dropped_bytes{0};
+	} stats_{};
 };
 INetEngine *create_engine_kqueue() {
 	return new KqueueEngine();
@@ -216,9 +231,18 @@ bool KqueueEngine::loop_once(uint32_t timeout_ms) {
 			if (sockets_.find(fd_to_close) != sockets_.end()) {
 				if (cbs_.on_close) cbs_.on_close(fd_to_close);
 				::close(fd_to_close);
-				sockets_.erase(fd_to_close);
+				{
+					auto itS = sockets_.find(fd_to_close);
+					if (itS != sockets_.end()) {
+						size_t pend = itS->second.out_queue.size();
+						if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+						sockets_.erase(itS);
+					}
+				}
 				if (cur_conn_ > 0) cur_conn_--;
 				timeouts_ms_.erase(fd_to_close);
+				stats_.timeouts.fetch_add(1, std::memory_order_relaxed);
+				stats_.closes.fetch_add(1, std::memory_order_relaxed);
 			}
 			continue;
 		}
@@ -235,10 +259,16 @@ bool KqueueEngine::loop_once(uint32_t timeout_ms) {
 				while (true) {
 					sockaddr_storage ss{}; socklen_t slen = sizeof(ss);
 					socket_t client = ::accept(fd, (sockaddr *)&ss, &slen);
-					if (client < 0) { if (errno==EAGAIN || errno==EWOULDBLOCK) break; else break; }
+					if (client < 0) { if (errno==EAGAIN || errno==EWOULDBLOCK) break; else { stats_.accepts_fail.fetch_add(1, std::memory_order_relaxed); break; } }
 					if (max_conn_>0 && cur_conn_.load()>=max_conn_) { ::close(client); continue; }
 					int fl = fcntl(client, F_GETFL, 0); if (fl<0) fl=0; fcntl(client, F_SETFL, fl|O_NONBLOCK);
 					SockState st{}; sockets_.emplace(client, std::move(st)); cur_conn_++;
+					{
+						auto cur = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+						uint64_t prev = stats_.peak_connections.load(std::memory_order_relaxed);
+						while (cur > prev && !stats_.peak_connections.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {}
+					}
+					stats_.accepts_ok.fetch_add(1, std::memory_order_relaxed);
 					IO_LOG_DBG("accept: client fd=%d", (int)client);
 					if (cbs_.on_accept) cbs_.on_accept(client);
 				}
@@ -250,6 +280,8 @@ bool KqueueEngine::loop_once(uint32_t timeout_ms) {
 			ssize_t n = ::recv(fd, st.buf, st.buf_size, 0);
 			if (n > 0) {
 				st.read_cb(fd, st.buf, (size_t)n);
+				stats_.reads.fetch_add(1, std::memory_order_relaxed);
+				stats_.bytes_read.fetch_add((uint64_t)n, std::memory_order_relaxed);
 				auto itT = timeouts_ms_.find(fd);
 				if (itT != timeouts_ms_.end() && itT->second > 0) {
 					struct kevent tev{};
@@ -261,7 +293,16 @@ bool KqueueEngine::loop_once(uint32_t timeout_ms) {
 				if (cbs_.on_close) cbs_.on_close(fd);
 				struct kevent dv{}; EV_SET(&dv, fd, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
 				(void)kevent(kq_, &dv, 1, nullptr, 0, nullptr);
-				sockets_.erase(fd); timeouts_ms_.erase(fd); if (cur_conn_>0) cur_conn_--; 
+				{
+					auto itS = sockets_.find(fd);
+					if (itS != sockets_.end()) {
+						size_t pend = itS->second.out_queue.size();
+						if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+						sockets_.erase(itS);
+					}
+				}
+				timeouts_ms_.erase(fd); if (cur_conn_>0) cur_conn_--; 
+				stats_.closes.fetch_add(1, std::memory_order_relaxed);
 			} else {
 				IO_LOG_ERR("recv(fd=%d) failed errno=%d (%s)", (int)fd, errno, std::strerror(errno));
 			}
@@ -277,12 +318,23 @@ bool KqueueEngine::loop_once(uint32_t timeout_ms) {
 					struct kevent rev{}; EV_SET(&rev, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
 					::kevent(kq_, &rev, 1, nullptr, 0, nullptr);
 					if (cbs_.on_accept) cbs_.on_accept(fd);
+					stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 				} else {
 					if (cbs_.on_close) cbs_.on_close(fd);
 					::close(fd);
 					struct kevent dv{}; EV_SET(&dv, fd, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
 					(void)kevent(kq_, &dv, 1, nullptr, 0, nullptr);
-					sockets_.erase(fd); timeouts_ms_.erase(fd);
+					{
+						auto itS = sockets_.find(fd);
+						if (itS != sockets_.end()) {
+							size_t pend = itS->second.out_queue.size();
+							if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+							sockets_.erase(itS);
+						}
+					}
+					timeouts_ms_.erase(fd);
+					stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
+					stats_.closes.fetch_add(1, std::memory_order_relaxed);
 				}
 				continue;
 			}
@@ -300,6 +352,9 @@ bool KqueueEngine::loop_once(uint32_t timeout_ms) {
 				}
 				if (n > 0) {
 					if (cbs_.on_write) cbs_.on_write(fd, (size_t)n);
+					stats_.writes.fetch_add(1, std::memory_order_relaxed);
+					stats_.bytes_written.fetch_add((uint64_t)n, std::memory_order_relaxed);
+					stats_.send_dequeued_bytes.fetch_add((uint64_t)n, std::memory_order_relaxed);
 					st.out_queue.erase(st.out_queue.begin(), st.out_queue.begin() + n);
 				}
 			}
@@ -340,7 +395,14 @@ bool KqueueEngine::delete_socket(socket_t socket) {
 	if (kevent(kq_, &ev, 1, nullptr, 0, nullptr) < 0) {
 		IO_LOG_ERR("kevent(DEL timer fd=%d) failed errno=%d (%s)", (int)socket, errno, std::strerror(errno));
 	}
-	sockets_.erase(socket);
+	{
+		auto it = sockets_.find(socket);
+		if (it != sockets_.end()) {
+			size_t pend = it->second.out_queue.size();
+			if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+			sockets_.erase(it);
+		}
+	}
 	timeouts_ms_.erase(socket);
 	return true;
 }
@@ -384,6 +446,7 @@ bool KqueueEngine::connect(socket_t fd, const char *host, uint16_t port, bool as
 		IO_LOG_DBG("connect: established fd=%d", (int)fd);
 		if (cbs_.on_accept)
 			cbs_.on_accept(fd);
+		stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 		return true;
 	}
 	if (async && (err == EINPROGRESS || err == EALREADY)) {
@@ -401,6 +464,7 @@ bool KqueueEngine::connect(socket_t fd, const char *host, uint16_t port, bool as
 		return true;
 	}
 	IO_LOG_ERR("connect(fd=%d) failed, res=%d, errno=%d (%s)", (int)fd, res, err, std::strerror(err));
+	stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
 	return false;
 }
 
@@ -411,6 +475,7 @@ bool KqueueEngine::disconnect(socket_t fd) {
 		IO_LOG_DBG("close: fd=%d", (int)fd);
 		if (cbs_.on_close)
 			cbs_.on_close(fd);
+		stats_.closes.fetch_add(1, std::memory_order_relaxed);
 	}
 	return true;
 }
@@ -437,6 +502,7 @@ bool KqueueEngine::write(socket_t fd, const char *data, size_t data_size) {
 		return false;
 	auto &st = it->second;
 	st.out_queue.insert(st.out_queue.end(), data, data + data_size);
+	stats_.send_enqueued_bytes.fetch_add((uint64_t)data_size, std::memory_order_relaxed);
 	if (!st.want_write) {
 		struct kevent ev{};
 		EV_SET(&ev, fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, nullptr);
@@ -450,13 +516,13 @@ bool KqueueEngine::write(socket_t fd, const char *data, size_t data_size) {
 bool KqueueEngine::post(uint32_t user_event_value) {
 	if (user_pipe_[1] != -1) {
 		ssize_t n = ::write(user_pipe_[1], &user_event_value, sizeof(user_event_value));
-		if (n == (ssize_t)sizeof(user_event_value))
-			return true;
+		if (n == (ssize_t)sizeof(user_event_value)) { stats_.user_events.fetch_add(1, std::memory_order_relaxed); return true; }
 	}
 	userq_.push_back(user_event_value);
 	struct kevent trig{};
 	EV_SET(&trig, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
 	(void)kevent(kq_, &trig, 1, nullptr, 0, nullptr);
+	stats_.user_events.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 
@@ -701,6 +767,49 @@ bool KqueueEngine::resume_read(socket_t socket) {
 		return false;
 	}
 	return true;
+}
+
+NetStats KqueueEngine::get_stats() {
+	NetStats s{};
+	s.accepts_ok = stats_.accepts_ok.load(std::memory_order_relaxed);
+	s.accepts_fail = stats_.accepts_fail.load(std::memory_order_relaxed);
+	s.connects_ok = stats_.connects_ok.load(std::memory_order_relaxed);
+	s.connects_fail = stats_.connects_fail.load(std::memory_order_relaxed);
+	s.reads = stats_.reads.load(std::memory_order_relaxed);
+	s.bytes_read = stats_.bytes_read.load(std::memory_order_relaxed);
+	s.writes = stats_.writes.load(std::memory_order_relaxed);
+	s.bytes_written = stats_.bytes_written.load(std::memory_order_relaxed);
+	s.closes = stats_.closes.load(std::memory_order_relaxed);
+	s.timeouts = stats_.timeouts.load(std::memory_order_relaxed);
+	s.user_events = stats_.user_events.load(std::memory_order_relaxed);
+	s.wakes_posted = stats_.wakes_posted.load(std::memory_order_relaxed);
+	s.current_connections = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+	s.peak_connections = stats_.peak_connections.load(std::memory_order_relaxed);
+	s.outstanding_accepts = 0;
+	s.send_enqueued_bytes = stats_.send_enqueued_bytes.load(std::memory_order_relaxed);
+	s.send_dequeued_bytes = stats_.send_dequeued_bytes.load(std::memory_order_relaxed);
+	s.send_backlog_bytes = (s.send_enqueued_bytes >= s.send_dequeued_bytes) ? (s.send_enqueued_bytes - s.send_dequeued_bytes) : 0;
+	s.send_dropped_bytes = stats_.send_dropped_bytes.load(std::memory_order_relaxed);
+	return s;
+}
+
+void KqueueEngine::reset_stats() {
+	stats_.accepts_ok.store(0, std::memory_order_relaxed);
+	stats_.accepts_fail.store(0, std::memory_order_relaxed);
+	stats_.connects_ok.store(0, std::memory_order_relaxed);
+	stats_.connects_fail.store(0, std::memory_order_relaxed);
+	stats_.reads.store(0, std::memory_order_relaxed);
+	stats_.bytes_read.store(0, std::memory_order_relaxed);
+	stats_.writes.store(0, std::memory_order_relaxed);
+	stats_.bytes_written.store(0, std::memory_order_relaxed);
+	stats_.closes.store(0, std::memory_order_relaxed);
+	stats_.timeouts.store(0, std::memory_order_relaxed);
+	stats_.user_events.store(0, std::memory_order_relaxed);
+	stats_.wakes_posted.store(0, std::memory_order_relaxed);
+	stats_.peak_connections.store((uint64_t)cur_conn_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	stats_.send_enqueued_bytes.store(0, std::memory_order_relaxed);
+	stats_.send_dequeued_bytes.store(0, std::memory_order_relaxed);
+	stats_.send_dropped_bytes.store(0, std::memory_order_relaxed);
 }
 
 } // namespace io

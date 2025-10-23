@@ -124,6 +124,34 @@ cmake --install build/release --prefix ./_install
 
 Примечание: set_read_timeout реализован во всех бэкендах (kqueue/epoll/io_uring/IOCP).
 
+### Метрики (диагностика и мониторинг)
+
+Библиотека предоставляет унифицированные метрики через `INetEngine::get_stats()` и `reset_stats()`.
+Снимок возвращает счётчики по приёмам/подключениям/чтениям/записям/закрытиям и т.д.,
+а также гейджи текущих соединений и размер глобального бэклога на запись. Реализация на Windows/IOCP
+заполняет расширенный набор полей (ошибки GQCS, события авто‑тюнинга AcceptEx). На других бэкендах
+счётчики могут оставаться нулевыми до появления реализации.
+
+Пример:
+
+```cpp
+io::NetStats st = eng->get_stats();
+std::fprintf(stderr,
+	"conns: cur=%llu peak=%llu, io: R=%llu/%lluB W=%llu/%lluB, closes=%llu, timeouts=%llu, backlog=%lluB\n",
+	(unsigned long long)st.current_connections,
+	(unsigned long long)st.peak_connections,
+	(unsigned long long)st.reads,
+	(unsigned long long)st.bytes_read,
+	(unsigned long long)st.writes,
+	(unsigned long long)st.bytes_written,
+	(unsigned long long)st.closes,
+	(unsigned long long)st.timeouts,
+	(unsigned long long)st.send_backlog_bytes);
+
+// Сбросить счётчики
+eng->reset_stats();
+```
+
 Логирование (Debug)
 - В Debug-сборке включены диагностические логи (отключаются с NDEBUG).
 - Во всех бэкендах логируется завершение connect (результат getsockopt(SO_ERROR) или эквивалент), что помогает при отладке сетевых флапов.

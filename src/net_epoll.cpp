@@ -50,6 +50,10 @@ class EpollEngine : public INetEngine {
 		destroy();
 	}
 
+	// Метрики
+	NetStats get_stats() override;
+	void reset_stats() override;
+
 	bool loop_once(uint32_t timeout_ms) override {
 		if (ep_ == -1) return false;
 		constexpr int MAXE = 64;
@@ -68,11 +72,24 @@ class EpollEngine : public INetEngine {
 					if (cbs_.on_close) cbs_.on_close(sfd);
 					(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, sfd, nullptr);
 					::shutdown(sfd, SHUT_RDWR); ::close(sfd);
-					bool dec=false; { auto itS = sockets_.find(sfd); if (itS != sockets_.end()) { dec = itS->second.server_side; sockets_.erase(itS);} }
+					bool dec=false; {
+						auto itS = sockets_.find(sfd);
+						if (itS != sockets_.end()) {
+							// учтём дроп по очереди отправки
+							size_t pend = (itS->second.out_queue.size() > itS->second.out_head)
+										? (itS->second.out_queue.size() - itS->second.out_head)
+										: 0;
+							if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+							dec = itS->second.server_side;
+							sockets_.erase(itS);
+						}
+					}
 					if (dec && cur_conn_>0) cur_conn_--;
 					auto itT = timers_.find(sfd);
 					if (itT != timers_.end()) { ::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::close(fd); owner_.erase(fd); timers_.erase(itT); }
 					timeouts_ms_.erase(sfd);
+					stats_.timeouts.fetch_add(1, std::memory_order_relaxed);
+					stats_.closes.fetch_add(1, std::memory_order_relaxed);
 				}
 				continue;
 			}
@@ -86,13 +103,19 @@ class EpollEngine : public INetEngine {
 				while (true) {
 					sockaddr_storage ss{}; socklen_t slen = sizeof(ss);
 					socket_t client = ::accept(fd, (sockaddr*)&ss, &slen);
-					if (client < 0) { if (errno==EAGAIN || errno==EWOULDBLOCK) break; else { IO_LOG_ERR("accept(listen fd=%d) failed errno=%d (%s)", fd, errno, std::strerror(errno)); break; } }
+					if (client < 0) { if (errno==EAGAIN || errno==EWOULDBLOCK) break; else { IO_LOG_ERR("accept(listen fd=%d) failed errno=%d (%s)", fd, errno, std::strerror(errno)); stats_.accepts_fail.fetch_add(1, std::memory_order_relaxed); break; } }
 					if (max_conn_>0 && cur_conn_.load()>=max_conn_) { ::close(client); continue; }
 					int fl = fcntl(client, F_GETFL, 0); if (fl<0) fl=0; fcntl(client, F_SETFL, fl|O_NONBLOCK);
 					epoll_event cev{}; cev.events = EPOLLIN | EPOLLRDHUP; cev.data.fd = client;
 					if (::epoll_ctl(ep_, EPOLL_CTL_ADD, client, &cev) != 0) { IO_LOG_ERR("epoll_ctl(ADD client fd=%d) failed errno=%d (%s)", (int)client, errno, std::strerror(errno)); ::close(client); continue; }
 					SockState st{}; st.active=true; st.server_side=true; sockets_.emplace(client, std::move(st));
-					cur_conn_++; IO_LOG_DBG("accept: client fd=%d", (int)client); if (cbs_.on_accept) cbs_.on_accept(client);
+					cur_conn_++;
+					// peak
+					auto cur = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+					uint64_t prev = stats_.peak_connections.load(std::memory_order_relaxed);
+					while (cur > prev && !stats_.peak_connections.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {}
+					stats_.accepts_ok.fetch_add(1, std::memory_order_relaxed);
+					IO_LOG_DBG("accept: client fd=%d", (int)client); if (cbs_.on_accept) cbs_.on_accept(client);
 				}
 				continue;
 			}
@@ -105,11 +128,13 @@ class EpollEngine : public INetEngine {
 					it->second.connecting=false; if (err==0) it->second.active=true;
 					if (err==0) {
 						IO_LOG_DBG("connect: established fd=%d", fd);
+						stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 						if (cbs_.on_accept) cbs_.on_accept(fd);
 						epoll_event ev{}; bool paused = it->second.paused; ev.events = (paused?0u:EPOLLIN) | EPOLLRDHUP; ev.data.fd = fd; (void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
 					} else {
 						if (cbs_.on_close) cbs_.on_close(fd);
 						(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::close(fd); sockets_.erase(fd); continue;
+						stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
 					}
 				}
 			}
@@ -125,12 +150,13 @@ class EpollEngine : public INetEngine {
 							io::record_broken_pipe(); IO_LOG_DBG("write: fd=%d EPIPE/ECONNRESET -> closing socket", fd);
 							if (cbs_.on_close) cbs_.on_close(fd);
 							(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::shutdown(fd, SHUT_RDWR); ::close(fd);
-							bool dec5=false; { auto itE=sockets_.find(fd); if (itE!=sockets_.end()) { dec5=itE->second.server_side; sockets_.erase(itE);} }
+							bool dec5=false; { auto itE=sockets_.find(fd); if (itE!=sockets_.end()) { size_t pend=(itE->second.out_queue.size()>itE->second.out_head)?(itE->second.out_queue.size()-itE->second.out_head):0; if(pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed); dec5=itE->second.server_side; sockets_.erase(itE);} }
 							if (dec5 && cur_conn_>0) cur_conn_--; auto itT=timers_.find(fd); if (itT!=timers_.end()) { int tfd=itT->second; (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd);
+							stats_.closes.fetch_add(1, std::memory_order_relaxed);
 							continue;
 						}
 					}
-					if (wn > 0) { if (cbs_.on_write) cbs_.on_write(fd, (size_t)wn); st.out_head += (size_t)wn; if (st.out_head == st.out_queue.size()) { st.out_queue.clear(); st.out_head = 0; } }
+					if (wn > 0) { if (cbs_.on_write) cbs_.on_write(fd, (size_t)wn); stats_.writes.fetch_add(1, std::memory_order_relaxed); stats_.bytes_written.fetch_add((uint64_t)wn, std::memory_order_relaxed); stats_.send_dequeued_bytes.fetch_add((uint64_t)wn, std::memory_order_relaxed); st.out_head += (size_t)wn; if (st.out_head == st.out_queue.size()) { st.out_queue.clear(); st.out_head = 0; } }
 					if (st.out_queue.empty() || st.out_head >= st.out_queue.size()) {
 						if (!st.out_queue.empty() && st.out_head > 0) { size_t remaining = st.out_queue.size()-st.out_head; if (remaining>0) std::memmove(st.out_queue.data(), st.out_queue.data()+st.out_head, remaining); st.out_queue.resize(remaining); st.out_head=0; }
 						epoll_event ev{}; bool paused_now = st.paused; ev.events = (paused_now?0u:EPOLLIN) | EPOLLRDHUP; ev.data.fd=fd; (void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
@@ -147,8 +173,10 @@ class EpollEngine : public INetEngine {
 					while (true) {
 						ssize_t rn = ::recv(fd, st.buf, st.buf_size, 0);
 						if (rn < 0) { int e=errno; if (e==EAGAIN || e==EWOULDBLOCK) break; IO_LOG_ERR("recv(fd=%d) failed errno=%d (%s)", fd, e, std::strerror(e)); break; }
-						if (rn == 0) { if (cbs_.on_close) cbs_.on_close(fd); (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()) { dec=itS->second.server_side; sockets_.erase(itS);} } if (dec && cur_conn_>0) cur_conn_--; auto itT = timers_.find(fd); if (itT != timers_.end()) { int tfd=itT->second; ::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd); break; }
+						if (rn == 0) { if (cbs_.on_close) cbs_.on_close(fd); (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()) { size_t pend=(itS->second.out_queue.size()>itS->second.out_head)?(itS->second.out_queue.size()-itS->second.out_head):0; if(pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed); dec=itS->second.server_side; sockets_.erase(itS);} } if (dec && cur_conn_>0) cur_conn_--; auto itT = timers_.find(fd); if (itT != timers_.end()) { int tfd=itT->second; ::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd); stats_.closes.fetch_add(1, std::memory_order_relaxed); break; }
 						st.read_cb(fd, st.buf, (size_t)rn);
+						stats_.reads.fetch_add(1, std::memory_order_relaxed);
+						stats_.bytes_read.fetch_add((uint64_t)rn, std::memory_order_relaxed);
 						did_read = true;
 						int tfd=-1; uint32_t ms=0; auto itT = timers_.find(fd); if (itT != timers_.end()) { tfd=itT->second; ms=timeouts_ms_[fd]; }
 						if (tfd != -1 && ms > 0) { itimerspec its{}; its.it_value.tv_sec = ms/1000; its.it_value.tv_nsec = (ms%1000) * 1000000L; (void)::timerfd_settime(tfd, 0, &its, nullptr); }
@@ -156,7 +184,7 @@ class EpollEngine : public INetEngine {
 				}
 				if (!did_read && (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))) {
 					bool fatal=false; if (events & EPOLLERR) { int soerr=0; socklen_t sl=sizeof(soerr); if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl)==0 && soerr!=0) fatal=true; } if (events & (EPOLLHUP | EPOLLRDHUP)) fatal=true;
-					if (fatal) { if (cbs_.on_close) cbs_.on_close(fd); (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::shutdown(fd, SHUT_RDWR); ::close(fd); bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()) { dec=itS->second.server_side; sockets_.erase(itS);} } if (dec && cur_conn_>0) cur_conn_--; auto itT=timers_.find(fd); if (itT != timers_.end()) { int tfd=itT->second; ::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd); }
+					if (fatal) { if (cbs_.on_close) cbs_.on_close(fd); (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::shutdown(fd, SHUT_RDWR); ::close(fd); bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()) { size_t pend=(itS->second.out_queue.size()>itS->second.out_head)?(itS->second.out_queue.size()-itS->second.out_head):0; if(pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed); dec=itS->second.server_side; sockets_.erase(itS);} } if (dec && cur_conn_>0) cur_conn_--; auto itT=timers_.find(fd); if (itT != timers_.end()) { int tfd=itT->second; ::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd); stats_.closes.fetch_add(1, std::memory_order_relaxed); }
 				}
 			}
 		}
@@ -223,13 +251,18 @@ class EpollEngine : public INetEngine {
 				while (true) {
 					sockaddr_storage ss{}; socklen_t slen = sizeof(ss);
 					socket_t client = ::accept(fd, (sockaddr*)&ss, &slen);
-					if (client < 0) { if (errno==EAGAIN || errno==EWOULDBLOCK) break; else { IO_LOG_ERR("accept(listen fd=%d) failed errno=%d (%s)", fd, errno, std::strerror(errno)); break; } }
+					if (client < 0) { if (errno==EAGAIN || errno==EWOULDBLOCK) break; else { IO_LOG_ERR("accept(listen fd=%d) failed errno=%d (%s)", fd, errno, std::strerror(errno)); stats_.accepts_fail.fetch_add(1, std::memory_order_relaxed); break; } }
 					if (max_conn_>0 && cur_conn_.load()>=max_conn_) { ::close(client); continue; }
 					int fl = fcntl(client, F_GETFL, 0); if (fl<0) fl=0; fcntl(client, F_SETFL, fl|O_NONBLOCK);
 					epoll_event cev{}; cev.events = EPOLLIN | EPOLLRDHUP; cev.data.fd = client;
 					if (::epoll_ctl(ep_, EPOLL_CTL_ADD, client, &cev) != 0) { IO_LOG_ERR("epoll_ctl(ADD client fd=%d) failed errno=%d (%s)", (int)client, errno, std::strerror(errno)); ::close(client); continue; }
 					SockState st{}; st.active=true; st.server_side=true; sockets_.emplace(client, std::move(st));
-					cur_conn_++; IO_LOG_DBG("accept: client fd=%d", (int)client); if (cbs_.on_accept) cbs_.on_accept(client);
+					cur_conn_++;
+					auto cur = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+					uint64_t prev = stats_.peak_connections.load(std::memory_order_relaxed);
+					while (cur > prev && !stats_.peak_connections.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {}
+					stats_.accepts_ok.fetch_add(1, std::memory_order_relaxed);
+					IO_LOG_DBG("accept: client fd=%d", (int)client); if (cbs_.on_accept) cbs_.on_accept(client);
 				}
 				continue;
 			}
@@ -242,11 +275,13 @@ class EpollEngine : public INetEngine {
 					it->second.connecting=false; if (err==0) it->second.active=true;
 					if (err==0) {
 						IO_LOG_DBG("connect: established fd=%d", fd);
+						stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 						if (cbs_.on_accept) cbs_.on_accept(fd);
 						epoll_event ev{}; bool paused = it->second.paused; ev.events = (paused?0u:EPOLLIN) | EPOLLRDHUP; ev.data.fd = fd; (void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
 					} else {
 						if (cbs_.on_close) cbs_.on_close(fd);
 						(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::close(fd); sockets_.erase(fd); continue;
+						stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
 					}
 				}
 			}
@@ -267,7 +302,7 @@ class EpollEngine : public INetEngine {
 							continue;
 						}
 					}
-					if (wn > 0) { IO_LOG_DBG("send: fd=%d, wrote=%zd/%zu (head=%zu -> %zu, total=%zu)", fd, wn, sz, st.out_head, st.out_head+(size_t)wn, st.out_queue.size()); if (cbs_.on_write) cbs_.on_write(fd, (size_t)wn); st.out_head += (size_t)wn; if (st.out_head == st.out_queue.size()) { st.out_queue.clear(); st.out_head = 0; } }
+					if (wn > 0) { IO_LOG_DBG("send: fd=%d, wrote=%zd/%zu (head=%zu -> %zu, total=%zu)", fd, wn, sz, st.out_head, st.out_head+(size_t)wn, st.out_queue.size()); if (cbs_.on_write) cbs_.on_write(fd, (size_t)wn); stats_.writes.fetch_add(1, std::memory_order_relaxed); stats_.bytes_written.fetch_add((uint64_t)wn, std::memory_order_relaxed); stats_.send_dequeued_bytes.fetch_add((uint64_t)wn, std::memory_order_relaxed); st.out_head += (size_t)wn; if (st.out_head == st.out_queue.size()) { st.out_queue.clear(); st.out_head = 0; } }
 					if (st.out_queue.empty() || st.out_head >= st.out_queue.size()) {
 						if (!st.out_queue.empty() && st.out_head > 0) { size_t remaining = st.out_queue.size()-st.out_head; if (remaining>0) std::memmove(st.out_queue.data(), st.out_queue.data()+st.out_head, remaining); st.out_queue.resize(remaining); st.out_head=0; }
 						epoll_event ev{}; bool paused_now = st.paused; ev.events = (paused_now?0u:EPOLLIN) | EPOLLRDHUP; ev.data.fd=fd; if (::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev) != 0) { IO_LOG_ERR("epoll_ctl(MOD fd=%d->IN) failed errno=%d (%s)", fd, errno, std::strerror(errno)); }
@@ -299,6 +334,8 @@ class EpollEngine : public INetEngine {
 						if (rn == 0) { if (cbs_.on_close) cbs_.on_close(fd); (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()) { dec=itS->second.server_side; sockets_.erase(itS);} } if (dec && cur_conn_>0) cur_conn_--; auto itT = timers_.find(fd); if (itT != timers_.end()) { int tfd=itT->second; ::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd); break; }
 						IO_LOG_DBG("recv: fd=%d, got=%zd", fd, rn);
 						st.read_cb(fd, st.buf, (size_t)rn);
+						stats_.reads.fetch_add(1, std::memory_order_relaxed);
+						stats_.bytes_read.fetch_add((uint64_t)rn, std::memory_order_relaxed);
 						did_read = true;
 						int tfd=-1; uint32_t ms=0; auto itT = timers_.find(fd); if (itT != timers_.end()) { tfd=itT->second; ms=timeouts_ms_[fd]; }
 						if (tfd != -1 && ms > 0) { itimerspec its{}; its.it_value.tv_sec = ms/1000; its.it_value.tv_nsec = (ms%1000) * 1000000L; if (::timerfd_settime(tfd, 0, &its, nullptr) != 0) { IO_LOG_ERR("timerfd_settime(fd=%d) failed errno=%d (%s)", tfd, errno, std::strerror(errno)); } }
@@ -306,7 +343,7 @@ class EpollEngine : public INetEngine {
 				}
 				if (!did_read && (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))) {
 					bool fatal=false; if (events & EPOLLERR) { int soerr=0; socklen_t sl=sizeof(soerr); if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl)==0 && soerr!=0) fatal=true; } if (events & (EPOLLHUP | EPOLLRDHUP)) fatal=true;
-					if (fatal) { if (cbs_.on_close) cbs_.on_close(fd); (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::shutdown(fd, SHUT_RDWR); ::close(fd); bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()) { dec=itS->second.server_side; sockets_.erase(itS);} } if (dec && cur_conn_>0) cur_conn_--; auto itT=timers_.find(fd); if (itT != timers_.end()) { int tfd=itT->second; ::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd); }
+					if (fatal) { if (cbs_.on_close) cbs_.on_close(fd); (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::shutdown(fd, SHUT_RDWR); ::close(fd); bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()) { size_t pend=(itS->second.out_queue.size()>itS->second.out_head)?(itS->second.out_queue.size()-itS->second.out_head):0; if(pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed); dec=itS->second.server_side; sockets_.erase(itS);} } if (dec && cur_conn_>0) cur_conn_--; auto itT=timers_.find(fd); if (itT != timers_.end()) { int tfd=itT->second; ::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd); stats_.closes.fetch_add(1, std::memory_order_relaxed); }
 				}
 			}
 			}
@@ -460,7 +497,14 @@ class EpollEngine : public INetEngine {
 			timers_.erase(itT);
 			timeouts_ms_.erase(fd);
 		}
-		sockets_.erase(fd);
+		{
+			auto it = sockets_.find(fd);
+			if (it != sockets_.end()) {
+				size_t pend = (it->second.out_queue.size() > it->second.out_head) ? (it->second.out_queue.size() - it->second.out_head) : 0;
+				if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+				sockets_.erase(it);
+			}
+		}
 		return true;
 	}
 	bool connect(socket_t fd, const char *host, uint16_t port, bool async) override {
@@ -503,6 +547,7 @@ class EpollEngine : public INetEngine {
 			(void)::epoll_ctl(ep_, EPOLL_CTL_ADD, fd, &ev);
 			if (cbs_.on_accept)
 				cbs_.on_accept(fd);
+			stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		}
 		if (async && err == EINPROGRESS) {
@@ -536,6 +581,7 @@ class EpollEngine : public INetEngine {
 		}
 		// immediate failure path (not in-progress)
 		IO_LOG_ERR("connect(fd=%d) failed, res=%d, errno=%d (%s)", (int)fd, r, err, std::strerror(err));
+		stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
 	bool disconnect(socket_t fd) override {
@@ -545,6 +591,8 @@ class EpollEngine : public INetEngine {
 			bool dec = false;
 			auto it = sockets_.find(fd);
 			if (it != sockets_.end()) {
+				size_t pend = (it->second.out_queue.size() > it->second.out_head) ? (it->second.out_queue.size() - it->second.out_head) : 0;
+				if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
 				dec = it->second.server_side;
 				sockets_.erase(it);
 			}
@@ -564,6 +612,7 @@ class EpollEngine : public INetEngine {
 			IO_LOG_DBG("close: fd=%d", (int)fd);
 			if (cbs_.on_close)
 				cbs_.on_close(fd);
+			stats_.closes.fetch_add(1, std::memory_order_relaxed);
 		}
 		return true;
 	}
@@ -606,6 +655,7 @@ class EpollEngine : public INetEngine {
 			}
 		}
 		st.out_queue.insert(st.out_queue.end(), data, data + data_size);
+		stats_.send_enqueued_bytes.fetch_add((uint64_t)data_size, std::memory_order_relaxed);
 #ifndef NDEBUG
 		IO_LOG_DBG("write queued fd=%d, bytes=%zu, want_write=%d (queued_total=%zu, head=%zu)", (int)fd, data_size,
 		           st.want_write ? 1 : 0, st.out_queue.size(), st.out_head);
@@ -638,6 +688,7 @@ class EpollEngine : public INetEngine {
 		if (user_pipe_[1] == -1)
 			return false;
 		ssize_t n = ::write(user_pipe_[1], &val, sizeof(val));
+		if (n == (ssize_t)sizeof(val)) stats_.user_events.fetch_add(1, std::memory_order_relaxed);
 		return n == (ssize_t)sizeof(val);
 	}
 	bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
@@ -729,6 +780,7 @@ class EpollEngine : public INetEngine {
 	protected:
 		void wake() override {
 				// Разбудить epoll_wait: пишем в user pipe
+				stats_.wakes_posted.fetch_add(1, std::memory_order_relaxed);
 				(void)post(0u);
 		}
 
@@ -757,11 +809,65 @@ class EpollEngine : public INetEngine {
 	std::unordered_map<socket_t, uint32_t> timeouts_ms_; // socket -> timeout ms
 	std::atomic<uint32_t> max_conn_{0};
 	std::atomic<uint32_t> cur_conn_{0};
+	struct StatsAtomic {
+		std::atomic<uint64_t> accepts_ok{0}, accepts_fail{0};
+		std::atomic<uint64_t> connects_ok{0}, connects_fail{0};
+		std::atomic<uint64_t> reads{0}, bytes_read{0};
+		std::atomic<uint64_t> writes{0}, bytes_written{0};
+		std::atomic<uint64_t> closes{0}, timeouts{0};
+		std::atomic<uint64_t> user_events{0}, wakes_posted{0};
+		std::atomic<uint64_t> peak_connections{0};
+		std::atomic<uint64_t> send_enqueued_bytes{0}, send_dequeued_bytes{0}, send_dropped_bytes{0};
+		std::atomic<uint64_t> gqcs_errors{0}; // not used here
+	} stats_{};
     
 };
 
 INetEngine *create_engine_epoll() {
 	return new EpollEngine();
+}
+
+NetStats EpollEngine::get_stats() {
+	NetStats s{};
+	s.accepts_ok = stats_.accepts_ok.load(std::memory_order_relaxed);
+	s.accepts_fail = stats_.accepts_fail.load(std::memory_order_relaxed);
+	s.connects_ok = stats_.connects_ok.load(std::memory_order_relaxed);
+	s.connects_fail = stats_.connects_fail.load(std::memory_order_relaxed);
+	s.reads = stats_.reads.load(std::memory_order_relaxed);
+	s.bytes_read = stats_.bytes_read.load(std::memory_order_relaxed);
+	s.writes = stats_.writes.load(std::memory_order_relaxed);
+	s.bytes_written = stats_.bytes_written.load(std::memory_order_relaxed);
+	s.closes = stats_.closes.load(std::memory_order_relaxed);
+	s.timeouts = stats_.timeouts.load(std::memory_order_relaxed);
+	s.user_events = stats_.user_events.load(std::memory_order_relaxed);
+	s.wakes_posted = stats_.wakes_posted.load(std::memory_order_relaxed);
+	s.current_connections = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+	s.peak_connections = stats_.peak_connections.load(std::memory_order_relaxed);
+	s.outstanding_accepts = 0;
+	s.send_enqueued_bytes = stats_.send_enqueued_bytes.load(std::memory_order_relaxed);
+	s.send_dequeued_bytes = stats_.send_dequeued_bytes.load(std::memory_order_relaxed);
+	s.send_backlog_bytes = (s.send_enqueued_bytes >= s.send_dequeued_bytes) ? (s.send_enqueued_bytes - s.send_dequeued_bytes) : 0;
+	s.send_dropped_bytes = stats_.send_dropped_bytes.load(std::memory_order_relaxed);
+	return s;
+}
+
+void EpollEngine::reset_stats() {
+	stats_.accepts_ok.store(0, std::memory_order_relaxed);
+	stats_.accepts_fail.store(0, std::memory_order_relaxed);
+	stats_.connects_ok.store(0, std::memory_order_relaxed);
+	stats_.connects_fail.store(0, std::memory_order_relaxed);
+	stats_.reads.store(0, std::memory_order_relaxed);
+	stats_.bytes_read.store(0, std::memory_order_relaxed);
+	stats_.writes.store(0, std::memory_order_relaxed);
+	stats_.bytes_written.store(0, std::memory_order_relaxed);
+	stats_.closes.store(0, std::memory_order_relaxed);
+	stats_.timeouts.store(0, std::memory_order_relaxed);
+	stats_.user_events.store(0, std::memory_order_relaxed);
+	stats_.wakes_posted.store(0, std::memory_order_relaxed);
+	stats_.peak_connections.store((uint64_t)cur_conn_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	stats_.send_enqueued_bytes.store(0, std::memory_order_relaxed);
+	stats_.send_dequeued_bytes.store(0, std::memory_order_relaxed);
+	stats_.send_dropped_bytes.store(0, std::memory_order_relaxed);
 }
 
 }; // namespace io

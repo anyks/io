@@ -33,9 +33,9 @@ echo "[windows_build_remote] Host=$WIN_USER@$WIN_HOST:$WIN_PORT Repo=$REMOTE_DIR
 
 # Build in foreground to stream output here; also write a remote log
 ssh "${SSH_OPTS[@]}" -p "$WIN_PORT" "$WIN_USER@$WIN_HOST" \
-  "C:/msys64/usr/bin/bash.exe -lc 'set -euo pipefail; cd \"$REMOTE_DIR\" && \
-    command -v timeout >/dev/null 2>&1 || echo \"[warn] coreutils timeout missing; install mingw-w64-x86_64-coreutils\"; \
-    : > build_remote.log; \
+  "C:/msys64/usr/bin/bash.exe -lc 'set -euo pipefail; export MSYSTEM=MINGW64; export CHERE_INVOKING=1; export PATH=/mingw64/bin:/usr/bin:\$PATH; \
+    which cmake || true; cmake --version || true; \
+    cd \"$REMOTE_DIR\" && : > build_remote.log; \
     ( env BUILD_TIMEOUT=$BUILD_TIMEOUT ./scripts/windows/msys2/build.sh \"$CONFIG\" ) 2>&1 | tee -a build_remote.log'"
 
 echo "[windows_build_remote] Build finished with exit code $?"

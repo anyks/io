@@ -63,6 +63,10 @@ class IouringEngine : public INetEngine {
 		destroy();
 	}
 
+	// Метрики
+	NetStats get_stats() override;
+	void reset_stats() override;
+
 	bool loop_once(uint32_t timeout_ms) override {
 		io_uring_cqe *cqe = nullptr;
 		int rc = 0;
@@ -221,6 +225,9 @@ class IouringEngine : public INetEngine {
 				it->second.timeout_armed = false;
 				it->second.timeout_key = 0;
 			}
+			if (!it->second.out_queue.empty()) {
+				stats_.send_dropped_bytes.fetch_add((uint64_t)it->second.out_queue.size(), std::memory_order_relaxed);
+			}
 			sockets_.erase(it);
 		}
 		return true;
@@ -288,10 +295,23 @@ class IouringEngine : public INetEngine {
 				it->second.timeout_armed = false;
 				it->second.timeout_key = 0;
 			}
+			// account dropped pending send bytes and erase from map
+			bool dec = false; size_t pend = 0;
+			{
+				auto itS = sockets_.find(fd);
+				if (itS != sockets_.end()) {
+					pend = itS->second.out_queue.size();
+					dec = itS->second.server_side;
+					sockets_.erase(itS);
+				}
+			}
+			if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+			if (dec && cur_conn_>0) cur_conn_--;
 			::shutdown(fd, SHUT_RDWR);
 			::close(fd);
 			if (cbs_.on_close)
 				cbs_.on_close(fd);
+			stats_.closes.fetch_add(1, std::memory_order_relaxed);
 		}
 		return true;
 	}
@@ -315,6 +335,7 @@ class IouringEngine : public INetEngine {
 			return false;
 		auto &st = it->second;
 		st.out_queue.insert(st.out_queue.end(), data, data + data_size);
+		stats_.send_enqueued_bytes.fetch_add((uint64_t)data_size, std::memory_order_relaxed);
 		if (!st.want_write) {
 			st.want_write = true;
 			submit_send(fd);
@@ -333,7 +354,8 @@ class IouringEngine : public INetEngine {
 		// Signal exactly one pending event via eventfd
 		uint64_t one = 1ull;
 		ssize_t n = ::write(user_efd_, &one, sizeof(one));
-		return n == (ssize_t)sizeof(one);
+		if (n == (ssize_t)sizeof(one)) { stats_.user_events.fetch_add(1, std::memory_order_relaxed); return true; }
+		return false;
 	}
 
 	bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
@@ -393,6 +415,16 @@ class IouringEngine : public INetEngine {
 	std::atomic<uint32_t> max_conn_{0};
 	std::atomic<uint32_t> cur_conn_{0};
 	bool connect_supported_{false};
+	struct StatsAtomic {
+		std::atomic<uint64_t> accepts_ok{0}, accepts_fail{0};
+		std::atomic<uint64_t> connects_ok{0}, connects_fail{0};
+		std::atomic<uint64_t> reads{0}, bytes_read{0};
+		std::atomic<uint64_t> writes{0}, bytes_written{0};
+		std::atomic<uint64_t> closes{0}, timeouts{0};
+		std::atomic<uint64_t> user_events{0}, wakes_posted{0};
+		std::atomic<uint64_t> peak_connections{0};
+		std::atomic<uint64_t> send_enqueued_bytes{0}, send_dequeued_bytes{0}, send_dropped_bytes{0};
+	} stats_{};
 
 	void handle_cqe(io_uring_cqe *cqe) {
 		UringData *ud = (UringData *)io_uring_cqe_get_data(cqe);
@@ -431,6 +463,13 @@ class IouringEngine : public INetEngine {
 								fl = 0;
 							fcntl(client, F_SETFL, fl | O_NONBLOCK);
 							cur_conn_++;
+							// peak update and accepts_ok
+							{
+								auto cur = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+								uint64_t prev = stats_.peak_connections.load(std::memory_order_relaxed);
+								while (cur > prev && !stats_.peak_connections.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {}
+								stats_.accepts_ok.fetch_add(1, std::memory_order_relaxed);
+							}
 							IO_LOG_DBG("accept: client fd=%d", (int)client);
 							// Предрегистрация клиента в sockets_ с пустым буфером до add_socket
 							{
@@ -450,6 +489,7 @@ class IouringEngine : public INetEngine {
 							e = errno;
 						IO_LOG_ERR("accept completion failed listen=%d errno=%d (%s)", (int)listen_fd, e,
 								   std::strerror(e));
+						stats_.accepts_fail.fetch_add(1, std::memory_order_relaxed);
 					}
 					submit_accept(listen_fd); // re-arm accept regardless of res
 					break;
@@ -469,6 +509,8 @@ class IouringEngine : public INetEngine {
 								size_t n = (size_t)res;
 								if (cb)
 									cb(fd, buf, n);
+								stats_.reads.fetch_add(1, std::memory_order_relaxed);
+								stats_.bytes_read.fetch_add((uint64_t)n, std::memory_order_relaxed);
 							}
 							// decide re-arms without holding mtx_
 							uint32_t ms = 0; bool had_timeout=false; uint64_t key=0;
@@ -496,6 +538,10 @@ class IouringEngine : public INetEngine {
 							IO_LOG_DBG("close: fd=%d", (int)fd);
 							if (cbs_.on_close)
 								cbs_.on_close(fd);
+							// account dropped pending send bytes
+							size_t pend = st.out_queue.size();
+							if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+							stats_.closes.fetch_add(1, std::memory_order_relaxed);
 							bool dec=false; {
 								auto itS = sockets_.find(fd);
 								if (itS != sockets_.end()) { dec = itS->second.server_side; sockets_.erase(itS);} }
@@ -517,6 +563,9 @@ class IouringEngine : public INetEngine {
 							}
 							if (wrote <= st.out_queue.size())
 								st.out_queue.erase(st.out_queue.begin(), st.out_queue.begin() + wrote);
+							stats_.writes.fetch_add(1, std::memory_order_relaxed);
+							stats_.bytes_written.fetch_add((uint64_t)wrote, std::memory_order_relaxed);
+							stats_.send_dequeued_bytes.fetch_add((uint64_t)wrote, std::memory_order_relaxed);
 						}
 						if (res < 0) {
 							int e = -res;
@@ -528,10 +577,14 @@ class IouringEngine : public INetEngine {
 									st.timeout_armed = false;
 									st.timeout_key = 0;
 								}
+								// account dropped pending bytes on abrupt close
+								size_t pend = st.out_queue.size();
+								if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
 								if (cbs_.on_close) cbs_.on_close(fd);
 								::close(fd);
 								bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()){ dec=itS->second.server_side; sockets_.erase(itS);} }
 								if (dec && cur_conn_>0) cur_conn_--;
+								stats_.closes.fetch_add(1, std::memory_order_relaxed);
 								break;
 							}
 						}
@@ -552,6 +605,7 @@ class IouringEngine : public INetEngine {
 							// native connect: res==0 success, negative error otherwise
 							if (res == 0) {
 								IO_LOG_DBG("connect: established fd=%d", (int)fd);
+								stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 								if (cbs_.on_accept) { IO_LOG_DBG("invoke on_accept(client) fd=%d", (int)fd); cbs_.on_accept(fd);} 
 								submit_recv(fd);
 							} else {
@@ -564,12 +618,14 @@ class IouringEngine : public INetEngine {
 									cbs_.on_close(fd);
 								::close(fd);
 								sockets_.erase(fd);
+								stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
 							}
 						} else if (ud->extra == 1) {
 							// poll path: res is revents bitmask (>=0). Check SO_ERROR to determine status.
 							if (res >= 0) {
-								int err = 0;
+								if (err == 0) {
 								socklen_t len = sizeof(err);
+									stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 								int gs = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
 								if (gs < 0) {
 									int e = errno;
@@ -577,10 +633,12 @@ class IouringEngine : public INetEngine {
 										   std::strerror(e));
 									err = e;
 								} else {
+									stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
 									IO_LOG_DBG("connect completion fd=%d, SO_ERROR=%d (%s)", (int)fd, err,
 										   std::strerror(err));
 								}
 								if (err == 0) {
+								stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 									IO_LOG_DBG("connect: established fd=%d", (int)fd);
 									if (cbs_.on_accept) { IO_LOG_DBG("invoke on_accept(client) fd=%d", (int)fd); cbs_.on_accept(fd);} 
 									submit_recv(fd);
@@ -628,9 +686,14 @@ class IouringEngine : public INetEngine {
 					if (res == -ETIME && fd != -1) {
 						if (cbs_.on_close)
 							cbs_.on_close(fd);
+						// account dropped bytes if any
+						size_t pend = 0; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()){ pend = itS->second.out_queue.size(); }}
+						if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
 						::close(fd);
 						bool dec=false; { auto itS=sockets_.find(fd); if (itS!=sockets_.end()){ dec=itS->second.server_side; sockets_.erase(itS);} }
 						if (dec && cur_conn_>0) cur_conn_--;
+						stats_.timeouts.fetch_add(1, std::memory_order_relaxed);
+						stats_.closes.fetch_add(1, std::memory_order_relaxed);
 					}
 					break;
 				}
@@ -909,6 +972,7 @@ class IouringEngine : public INetEngine {
 
 	void wake() override {
 		// Постим пользовательское событие, чтобы разбудить wait_cqe/timeout
+		stats_.wakes_posted.fetch_add(1, std::memory_order_relaxed);
 		(void)post(1u);
 	}
 };
@@ -918,5 +982,50 @@ INetEngine *create_engine_iouring() {
 }
 
 } // namespace io
+
+NetStats IouringEngine::get_stats() {
+	NetStats s{};
+	s.accepts_ok = stats_.accepts_ok.load(std::memory_order_relaxed);
+	s.accepts_fail = stats_.accepts_fail.load(std::memory_order_relaxed);
+	s.connects_ok = stats_.connects_ok.load(std::memory_order_relaxed);
+	s.connects_fail = stats_.connects_fail.load(std::memory_order_relaxed);
+	s.reads = stats_.reads.load(std::memory_order_relaxed);
+	s.bytes_read = stats_.bytes_read.load(std::memory_order_relaxed);
+	s.writes = stats_.writes.load(std::memory_order_relaxed);
+	s.bytes_written = stats_.bytes_written.load(std::memory_order_relaxed);
+	s.closes = stats_.closes.load(std::memory_order_relaxed);
+	s.timeouts = stats_.timeouts.load(std::memory_order_relaxed);
+	s.user_events = stats_.user_events.load(std::memory_order_relaxed);
+	s.wakes_posted = stats_.wakes_posted.load(std::memory_order_relaxed);
+	s.current_connections = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+	s.peak_connections = stats_.peak_connections.load(std::memory_order_relaxed);
+	s.outstanding_accepts = 0; // we don't track depth here
+	s.send_enqueued_bytes = stats_.send_enqueued_bytes.load(std::memory_order_relaxed);
+	s.send_dequeued_bytes = stats_.send_dequeued_bytes.load(std::memory_order_relaxed);
+	s.send_backlog_bytes = (s.send_enqueued_bytes >= s.send_dequeued_bytes)
+						    ? (s.send_enqueued_bytes - s.send_dequeued_bytes)
+						    : 0;
+	s.send_dropped_bytes = stats_.send_dropped_bytes.load(std::memory_order_relaxed);
+	return s;
+}
+
+void IouringEngine::reset_stats() {
+	stats_.accepts_ok.store(0, std::memory_order_relaxed);
+	stats_.accepts_fail.store(0, std::memory_order_relaxed);
+	stats_.connects_ok.store(0, std::memory_order_relaxed);
+	stats_.connects_fail.store(0, std::memory_order_relaxed);
+	stats_.reads.store(0, std::memory_order_relaxed);
+	stats_.bytes_read.store(0, std::memory_order_relaxed);
+	stats_.writes.store(0, std::memory_order_relaxed);
+	stats_.bytes_written.store(0, std::memory_order_relaxed);
+	stats_.closes.store(0, std::memory_order_relaxed);
+	stats_.timeouts.store(0, std::memory_order_relaxed);
+	stats_.user_events.store(0, std::memory_order_relaxed);
+	stats_.wakes_posted.store(0, std::memory_order_relaxed);
+	stats_.peak_connections.store((uint64_t)cur_conn_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	stats_.send_enqueued_bytes.store(0, std::memory_order_relaxed);
+	stats_.send_dequeued_bytes.store(0, std::memory_order_relaxed);
+	stats_.send_dropped_bytes.store(0, std::memory_order_relaxed);
+}
 
 #endif

@@ -37,6 +37,10 @@ class DevPollEngine : public INetEngine {
 	~DevPollEngine() override {
 		destroy();
 	}
+
+	// Метрики
+	NetStats get_stats() override;
+	void reset_stats() override;
 	bool init(const NetCallbacks &cbs) override {
 		cbs_ = cbs;
 		// Suppress SIGPIPE (POSIX) once per process
@@ -90,7 +94,14 @@ class DevPollEngine : public INetEngine {
 	bool delete_socket(socket_t fd) override {
 		rem_poll(fd);
 		timers_.erase(fd);
-		sockets_.erase(fd);
+		{
+			auto it = sockets_.find(fd);
+			if (it != sockets_.end()) {
+				size_t pend = it->second.out_queue.size();
+				if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+				sockets_.erase(it);
+			}
+		}
 		timeouts_ms_.erase(fd);
 		return true;
 	}
@@ -117,6 +128,7 @@ class DevPollEngine : public INetEngine {
 			add_poll(fd, POLLIN | POLLRDNORM | POLLHUP);
 			if (cbs_.on_accept)
 				cbs_.on_accept(fd);
+			stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		}
 		if (async && (err == EINPROGRESS)) {
@@ -125,6 +137,7 @@ class DevPollEngine : public INetEngine {
 			return true;
 		}
 		IO_LOG_ERR("connect(fd=%d) failed, res=%d, errno=%d (%s)", (int)fd, r, err, std::strerror(err));
+		stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
 	bool disconnect(socket_t fd) override {
@@ -134,6 +147,7 @@ class DevPollEngine : public INetEngine {
 			IO_LOG_DBG("close: fd=%d", (int)fd);
 			if (cbs_.on_close)
 				cbs_.on_close(fd);
+			stats_.closes.fetch_add(1, std::memory_order_relaxed);
 		}
 		return true;
 	}
@@ -153,6 +167,7 @@ class DevPollEngine : public INetEngine {
 			return false;
 		auto &st = it->second;
 		st.out_queue.insert(st.out_queue.end(), data, data + data_size);
+		stats_.send_enqueued_bytes.fetch_add((uint64_t)data_size, std::memory_order_relaxed);
 		if (!st.want_write) {
 			st.want_write = true;
 			add_poll(fd, POLLIN | POLLRDNORM | POLLOUT | POLLHUP);
@@ -185,7 +200,8 @@ class DevPollEngine : public INetEngine {
 		if (user_pipe_[1] == -1)
 			return false;
 		ssize_t n = ::write(user_pipe_[1], &val, sizeof(val));
-		return n == (ssize_t)sizeof(val);
+		if (n == (ssize_t)sizeof(val)) { stats_.user_events.fetch_add(1, std::memory_order_relaxed); return true; }
+		return false;
 	}
 	// IOCP-specific APIs: provide no-op implementations for non-IOCP backends
 	bool set_accept_depth(socket_t /*listen_socket*/, uint32_t /*depth*/) override { return true; }
@@ -235,6 +251,16 @@ class DevPollEngine : public INetEngine {
 	std::unordered_map<socket_t, TimerInfo> timers_;
 	std::atomic<uint32_t> max_conn_{0};
 	std::atomic<uint32_t> cur_conn_{0};
+	struct StatsAtomic {
+		std::atomic<uint64_t> accepts_ok{0}, accepts_fail{0};
+		std::atomic<uint64_t> connects_ok{0}, connects_fail{0};
+		std::atomic<uint64_t> reads{0}, bytes_read{0};
+		std::atomic<uint64_t> writes{0}, bytes_written{0};
+		std::atomic<uint64_t> closes{0}, timeouts{0};
+		std::atomic<uint64_t> user_events{0};
+		std::atomic<uint64_t> peak_connections{0};
+		std::atomic<uint64_t> send_enqueued_bytes{0}, send_dequeued_bytes{0}, send_dropped_bytes{0};
+	} stats_{};
 
 	int compute_next_timeout_ms(std::chrono::steady_clock::time_point now) {
 		bool has_any=false; auto next = now + std::chrono::hours(24);
@@ -250,8 +276,18 @@ class DevPollEngine : public INetEngine {
 			rem_poll((int)sfd);
 			if (cbs_.on_close) cbs_.on_close(sfd);
 			::shutdown((int)sfd, SHUT_RDWR); ::close((int)sfd);
-			sockets_.erase(sfd); timers_.erase(sfd); timeouts_ms_.erase(sfd);
+			{
+				auto it2 = sockets_.find(sfd);
+				if (it2 != sockets_.end()) {
+					size_t pend = it2->second.out_queue.size();
+					if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+					sockets_.erase(it2);
+				}
+			}
+			timers_.erase(sfd); timeouts_ms_.erase(sfd);
 			if (cur_conn_>0) cur_conn_--;
+			stats_.timeouts.fetch_add(1, std::memory_order_relaxed);
+			stats_.closes.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 	void add_poll(int fd, short events) {
@@ -308,6 +344,7 @@ class DevPollEngine : public INetEngine {
 							else {
 								IO_LOG_ERR("accept(listen fd=%d) failed errno=%d (%s)", fd, errno,
 										   std::strerror(errno));
+								stats_.accepts_fail.fetch_add(1, std::memory_order_relaxed);
 								break;
 							}
 						}
@@ -325,6 +362,12 @@ class DevPollEngine : public INetEngine {
 							sockets_.emplace((socket_t)client, std::move(st));
 						}
 						cur_conn_++;
+						{
+							auto cur = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+							uint64_t prev = stats_.peak_connections.load(std::memory_order_relaxed);
+							while (cur > prev && !stats_.peak_connections.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {}
+						}
+						stats_.accepts_ok.fetch_add(1, std::memory_order_relaxed);
 						IO_LOG_DBG("accept: client fd=%d", (int)client);
 						if (cbs_.on_accept)
 							cbs_.on_accept(client);
@@ -354,7 +397,16 @@ class DevPollEngine : public INetEngine {
 							if (cbs_.on_close)
 								cbs_.on_close(fd);
 							::close(fd);
-							sockets_.erase(fd);
+							{
+								auto it2 = sockets_.find(fd);
+								if (it2 != sockets_.end()) {
+									size_t pend = it2->second.out_queue.size();
+									if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+									sockets_.erase(it2);
+								}
+							}
+							stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
+							stats_.closes.fetch_add(1, std::memory_order_relaxed);
 							continue;
 						}
 					}
@@ -371,8 +423,10 @@ class DevPollEngine : public INetEngine {
 					if (!st.buf || st.buf_size == 0 || !st.read_cb)
 						continue;
 					ssize_t rn = ::recv(fd, st.buf, st.buf_size, 0);
-					if (rn > 0) {
+						if (rn > 0) {
 						st.read_cb(fd, st.buf, (size_t)rn);
+							stats_.reads.fetch_add(1, std::memory_order_relaxed);
+							stats_.bytes_read.fetch_add((uint64_t)rn, std::memory_order_relaxed);
 						// Rearm timer deadline
 						auto itT = timers_.find(fd);
 						if (itT != timers_.end()) { uint32_t ms = itT->second.ms; itT->second.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms); itT->second.active = true; }
@@ -381,10 +435,18 @@ class DevPollEngine : public INetEngine {
 						rem_poll(fd);
 						if (cbs_.on_close)
 							cbs_.on_close(fd);
-						::close(fd);
-						sockets_.erase(fd);
+							::close(fd);
+							{
+								auto it2 = sockets_.find(fd);
+								if (it2 != sockets_.end()) {
+									size_t pend = it2->second.out_queue.size();
+									if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+									sockets_.erase(it2);
+								}
+							}
 						if (cur_conn_ > 0)
 							cur_conn_--;
+							stats_.closes.fetch_add(1, std::memory_order_relaxed);
 						timers_.erase(fd);
 						timeouts_ms_.erase(fd);
 					}
@@ -399,6 +461,9 @@ class DevPollEngine : public INetEngine {
 						if (wn > 0) {
 							if (cbs_.on_write)
 								cbs_.on_write(fd, (size_t)wn);
+							stats_.writes.fetch_add(1, std::memory_order_relaxed);
+							stats_.bytes_written.fetch_add((uint64_t)wn, std::memory_order_relaxed);
+							stats_.send_dequeued_bytes.fetch_add((uint64_t)wn, std::memory_order_relaxed);
 							st.out_queue.erase(st.out_queue.begin(), st.out_queue.begin() + wn);
 						} else if (wn < 0) {
 							int e = errno;
@@ -436,6 +501,47 @@ class DevPollEngine : public INetEngine {
 
 INetEngine *create_engine_devpoll() {
 	return new DevPollEngine();
+}
+
+NetStats DevPollEngine::get_stats() {
+	NetStats s{};
+	s.accepts_ok = stats_.accepts_ok.load(std::memory_order_relaxed);
+	s.accepts_fail = stats_.accepts_fail.load(std::memory_order_relaxed);
+	s.connects_ok = stats_.connects_ok.load(std::memory_order_relaxed);
+	s.connects_fail = stats_.connects_fail.load(std::memory_order_relaxed);
+	s.reads = stats_.reads.load(std::memory_order_relaxed);
+	s.bytes_read = stats_.bytes_read.load(std::memory_order_relaxed);
+	s.writes = stats_.writes.load(std::memory_order_relaxed);
+	s.bytes_written = stats_.bytes_written.load(std::memory_order_relaxed);
+	s.closes = stats_.closes.load(std::memory_order_relaxed);
+	s.timeouts = stats_.timeouts.load(std::memory_order_relaxed);
+	s.user_events = stats_.user_events.load(std::memory_order_relaxed);
+	s.current_connections = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+	s.peak_connections = stats_.peak_connections.load(std::memory_order_relaxed);
+	s.outstanding_accepts = 0;
+	s.send_enqueued_bytes = stats_.send_enqueued_bytes.load(std::memory_order_relaxed);
+	s.send_dequeued_bytes = stats_.send_dequeued_bytes.load(std::memory_order_relaxed);
+	s.send_backlog_bytes = (s.send_enqueued_bytes >= s.send_dequeued_bytes) ? (s.send_enqueued_bytes - s.send_dequeued_bytes) : 0;
+	s.send_dropped_bytes = stats_.send_dropped_bytes.load(std::memory_order_relaxed);
+	return s;
+}
+
+void DevPollEngine::reset_stats() {
+	stats_.accepts_ok.store(0, std::memory_order_relaxed);
+	stats_.accepts_fail.store(0, std::memory_order_relaxed);
+	stats_.connects_ok.store(0, std::memory_order_relaxed);
+	stats_.connects_fail.store(0, std::memory_order_relaxed);
+	stats_.reads.store(0, std::memory_order_relaxed);
+	stats_.bytes_read.store(0, std::memory_order_relaxed);
+	stats_.writes.store(0, std::memory_order_relaxed);
+	stats_.bytes_written.store(0, std::memory_order_relaxed);
+	stats_.closes.store(0, std::memory_order_relaxed);
+	stats_.timeouts.store(0, std::memory_order_relaxed);
+	stats_.user_events.store(0, std::memory_order_relaxed);
+	stats_.peak_connections.store((uint64_t)cur_conn_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	stats_.send_enqueued_bytes.store(0, std::memory_order_relaxed);
+	stats_.send_dequeued_bytes.store(0, std::memory_order_relaxed);
+	stats_.send_dropped_bytes.store(0, std::memory_order_relaxed);
 }
 
 } // namespace io

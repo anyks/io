@@ -38,6 +38,10 @@ class EventPortsEngine : public INetEngine {
     EventPortsEngine() = default;
     ~EventPortsEngine() override { destroy(); }
 
+        // Метрики
+        NetStats get_stats() override;
+        void reset_stats() override;
+
     bool init(const NetCallbacks &cbs) override {
         cbs_ = cbs;
         // Suppress SIGPIPE (POSIX) once per process
@@ -87,7 +91,14 @@ class EventPortsEngine : public INetEngine {
 
     bool delete_socket(socket_t fd) override {
         (void)::port_dissociate(port_, PORT_SOURCE_FD, fd);
-        sockets_.erase(fd);
+        {
+            auto it = sockets_.find(fd);
+            if (it != sockets_.end()) {
+                size_t pend = it->second.out_queue.size();
+                if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+                sockets_.erase(it);
+            }
+        }
         timers_.erase(fd);
         return true;
     }
@@ -114,6 +125,7 @@ class EventPortsEngine : public INetEngine {
             (void)::port_associate(port_, PORT_SOURCE_FD, fd, mask, nullptr);
             IO_LOG_DBG("connect: established fd=%d", (int)fd);
             if (cbs_.on_accept) cbs_.on_accept(fd);
+            stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         if (async && (err == EINPROGRESS || err == EALREADY)) {
@@ -123,6 +135,7 @@ class EventPortsEngine : public INetEngine {
             return true;
         }
         IO_LOG_ERR("connect(fd=%d) failed, res=%d, errno=%d (%s)", (int)fd, r, err, std::strerror(err));
+        stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -132,6 +145,7 @@ class EventPortsEngine : public INetEngine {
             ::close(fd);
             IO_LOG_DBG("close: fd=%d", (int)fd);
             if (cbs_.on_close) cbs_.on_close(fd);
+            stats_.closes.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
     }
@@ -152,6 +166,7 @@ class EventPortsEngine : public INetEngine {
         if (it == sockets_.end()) return false;
         auto &st = it->second;
         st.out_queue.insert(st.out_queue.end(), data, data + data_size);
+        stats_.send_enqueued_bytes.fetch_add((uint64_t)data_size, std::memory_order_relaxed);
         if (!st.want_write) {
             st.want_write = true;
             short mask = POLLHUP | POLLOUT;
@@ -164,7 +179,8 @@ class EventPortsEngine : public INetEngine {
     bool post(uint32_t user_event_value) override {
         // Deliver user events via native event ports user-source
         // Differentiate from timer wakeups by passing nullptr as user data
-        return ::port_send(port_, (uintptr_t)user_event_value, nullptr) == 0;
+        if (::port_send(port_, (uintptr_t)user_event_value, nullptr) == 0) { stats_.user_events.fetch_add(1, std::memory_order_relaxed); return true; }
+        return false;
     }
 
     bool set_read_timeout(socket_t socket, uint32_t timeout_ms) override {
@@ -237,6 +253,16 @@ class EventPortsEngine : public INetEngine {
     std::unordered_map<socket_t, TimerInfoStore> timers_;
     std::atomic<uint32_t> max_conn_{0};
     std::atomic<uint32_t> cur_conn_{0};
+    struct StatsAtomic {
+        std::atomic<uint64_t> accepts_ok{0}, accepts_fail{0};
+        std::atomic<uint64_t> connects_ok{0}, connects_fail{0};
+        std::atomic<uint64_t> reads{0}, bytes_read{0};
+        std::atomic<uint64_t> writes{0}, bytes_written{0};
+        std::atomic<uint64_t> closes{0}, timeouts{0};
+        std::atomic<uint64_t> user_events{0}, wakes_posted{0};
+        std::atomic<uint64_t> peak_connections{0};
+        std::atomic<uint64_t> send_enqueued_bytes{0}, send_dequeued_bytes{0}, send_dropped_bytes{0};
+    } stats_{};
 
     // Compute next timeout in milliseconds for active timers; returns -1 if none (infinite)
     int compute_next_timeout_ms(std::chrono::steady_clock::time_point now) {
@@ -267,8 +293,14 @@ class EventPortsEngine : public INetEngine {
                 (void)::port_dissociate(port_, PORT_SOURCE_FD, sfd);
                 ::shutdown(sfd, SHUT_RDWR);
                 ::close(sfd);
-                sockets_.erase(itS);
+                {
+                    size_t pend = itS->second.out_queue.size();
+                    if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+                    sockets_.erase(itS);
+                }
                 if (cur_conn_ > 0) cur_conn_--;
+                stats_.timeouts.fetch_add(1, std::memory_order_relaxed);
+                stats_.closes.fetch_add(1, std::memory_order_relaxed);
             }
             timers_.erase(sfd);
         }
@@ -350,7 +382,15 @@ class EventPortsEngine : public INetEngine {
                         } else {
                             if (cbs_.on_close) cbs_.on_close(fd);
                             ::close(fd);
-                            sockets_.erase(fd);
+                            {
+                                auto it2 = sockets_.find(fd);
+                                if (it2 != sockets_.end()) {
+                                    size_t pend = it2->second.out_queue.size();
+                                    if (pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed);
+                                    sockets_.erase(it2);
+                                }
+                            }
+                            stats_.closes.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                     }
@@ -396,6 +436,9 @@ class EventPortsEngine : public INetEngine {
                         ssize_t wn = ::send(fd, p, sz, 0);
                         if (wn > 0) {
                             if (cbs_.on_write) cbs_.on_write(fd, (size_t)wn);
+                            stats_.writes.fetch_add(1, std::memory_order_relaxed);
+                            stats_.bytes_written.fetch_add((uint64_t)wn, std::memory_order_relaxed);
+                            stats_.send_dequeued_bytes.fetch_add((uint64_t)wn, std::memory_order_relaxed);
                             st.out_queue.erase(st.out_queue.begin(), st.out_queue.begin() + wn);
                         } else if (wn < 0) {
                             int e = errno;
@@ -450,11 +493,55 @@ class EventPortsEngine : public INetEngine {
     void wake() override {
         // Wake port_getn via user event
         (void)::port_send(port_, 0, nullptr);
+        stats_.wakes_posted.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
 INetEngine *create_engine_eventports() {
     return new EventPortsEngine();
+}
+
+NetStats EventPortsEngine::get_stats() {
+    NetStats s{};
+    s.accepts_ok = stats_.accepts_ok.load(std::memory_order_relaxed);
+    s.accepts_fail = stats_.accepts_fail.load(std::memory_order_relaxed);
+    s.connects_ok = stats_.connects_ok.load(std::memory_order_relaxed);
+    s.connects_fail = stats_.connects_fail.load(std::memory_order_relaxed);
+    s.reads = stats_.reads.load(std::memory_order_relaxed);
+    s.bytes_read = stats_.bytes_read.load(std::memory_order_relaxed);
+    s.writes = stats_.writes.load(std::memory_order_relaxed);
+    s.bytes_written = stats_.bytes_written.load(std::memory_order_relaxed);
+    s.closes = stats_.closes.load(std::memory_order_relaxed);
+    s.timeouts = stats_.timeouts.load(std::memory_order_relaxed);
+    s.user_events = stats_.user_events.load(std::memory_order_relaxed);
+    s.wakes_posted = stats_.wakes_posted.load(std::memory_order_relaxed);
+    s.current_connections = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
+    s.peak_connections = stats_.peak_connections.load(std::memory_order_relaxed);
+    s.outstanding_accepts = 0;
+    s.send_enqueued_bytes = stats_.send_enqueued_bytes.load(std::memory_order_relaxed);
+    s.send_dequeued_bytes = stats_.send_dequeued_bytes.load(std::memory_order_relaxed);
+    s.send_backlog_bytes = (s.send_enqueued_bytes >= s.send_dequeued_bytes) ? (s.send_enqueued_bytes - s.send_dequeued_bytes) : 0;
+    s.send_dropped_bytes = stats_.send_dropped_bytes.load(std::memory_order_relaxed);
+    return s;
+}
+
+void EventPortsEngine::reset_stats() {
+    stats_.accepts_ok.store(0, std::memory_order_relaxed);
+    stats_.accepts_fail.store(0, std::memory_order_relaxed);
+    stats_.connects_ok.store(0, std::memory_order_relaxed);
+    stats_.connects_fail.store(0, std::memory_order_relaxed);
+    stats_.reads.store(0, std::memory_order_relaxed);
+    stats_.bytes_read.store(0, std::memory_order_relaxed);
+    stats_.writes.store(0, std::memory_order_relaxed);
+    stats_.bytes_written.store(0, std::memory_order_relaxed);
+    stats_.closes.store(0, std::memory_order_relaxed);
+    stats_.timeouts.store(0, std::memory_order_relaxed);
+    stats_.user_events.store(0, std::memory_order_relaxed);
+    stats_.wakes_posted.store(0, std::memory_order_relaxed);
+    stats_.peak_connections.store((uint64_t)cur_conn_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats_.send_enqueued_bytes.store(0, std::memory_order_relaxed);
+    stats_.send_dequeued_bytes.store(0, std::memory_order_relaxed);
+    stats_.send_dropped_bytes.store(0, std::memory_order_relaxed);
 }
 
 } // namespace io
