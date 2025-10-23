@@ -51,6 +51,15 @@ jobs:
             build/**/stress/*.log
             build/**/stress/parallel_*.log
             build/**/stress/**.log
+      - name: Upload FULL build dir on failure (Linux)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build-dump
+          path: |
+            build/**
+          if-no-files-found: warn
+          retention-days: 5
 
   macos:
     runs-on: macos-latest
@@ -96,3 +105,12 @@ jobs:
             build/**/stress/*.log
             build/**/stress/parallel_*.log
             build/**/stress/**.log
+      - name: Upload FULL build dir on failure (macOS)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build-dump
+          path: |
+            build/**
+          if-no-files-found: warn
+          retention-days: 5

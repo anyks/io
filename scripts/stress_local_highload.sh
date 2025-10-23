@@ -51,6 +51,13 @@ done
 
 if [[ "$status" -ne 0 ]]; then
   echo "[fail] Parallel phase had failures. See ${LOG_DIR}/parallel_*.log"
+  echo "[diag] Dumping last 200 lines of each parallel log if present:"
+  for lf in "${LOG_DIR}"/parallel_*.log; do
+    if [[ -f "$lf" ]]; then
+      echo "==== $lf ===="
+      tail -n 200 "$lf" || true
+    fi
+  done
   exit 1
 fi
 
