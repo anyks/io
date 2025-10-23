@@ -1,42 +1,42 @@
 #include "io/net.hpp"
 #if defined(IO_ENGINE_IOURING)
 #include <arpa/inet.h>
-							if (res >= 0) {
-								int err = 0;
-								socklen_t len = sizeof(err);
-								int gs = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
-								if (gs < 0) {
-									int e = errno;
-									IO_LOG_ERR("getsockopt(SO_ERROR fd=%d) failed errno=%d (%s)", (int)fd, e, std::strerror(e));
-									err = e;
-								} else {
-									IO_LOG_DBG("connect completion fd=%d, SO_ERROR=%d (%s)", (int)fd, err, std::strerror(err));
-								}
-								if (err == 0) {
-									IO_LOG_DBG("connect: established fd=%d", (int)fd);
-									stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
-									if (cbs_.on_accept) { IO_LOG_DBG("invoke on_accept(client) fd=%d", (int)fd); cbs_.on_accept(fd);} 
-									submit_recv(fd);
-								} else {
-									if (cbs_.on_close)
-										cbs_.on_close(fd);
-									::close(fd);
-									sockets_.erase(fd);
-									stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
-								}
-							} else {
-								if (cbs_.on_close)
-									cbs_.on_close(fd);
-								::close(fd);
-								sockets_.erase(fd);
-							}
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <fcntl.h>
+#include <mutex>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <liburing.h>
+
+// Логирование: ошибки в Debug, отладка по флагу IO_ENABLE_IOURING_VERBOSE
+#ifndef NDEBUG
+#define IO_LOG_ERR(...)                                                                                                 \
+    do {                                                                                                                \
+        std::fprintf(stderr, "[io/iouring][ERR] ");                                                                    \
+        std::fprintf(stderr, __VA_ARGS__);                                                                              \
+        std::fprintf(stderr, "\n");                                                                                     \
+    } while (0)
+#else
+#define IO_LOG_ERR(...) ((void)0)
+#endif
+
 #ifdef IO_ENABLE_IOURING_VERBOSE
 #define IO_LOG_DBG(...)                                                                                                 \
-	do {                                                                                                                \
-							stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
-		std::fprintf(stderr, __VA_ARGS__);                                                                              \
-		std::fprintf(stderr, "\n");                                                                                     \
-	} while (0)
+    do {                                                                                                                \
+        std::fprintf(stderr, "[io/iouring][DBG] ");                                                                    \
+        std::fprintf(stderr, __VA_ARGS__);                                                                              \
+        std::fprintf(stderr, "\n");                                                                                     \
+    } while (0)
 #else
 #define IO_LOG_DBG(...) ((void)0)
 #endif
@@ -71,38 +71,33 @@ class IouringEngine : public INetEngine {
 			rc = io_uring_wait_cqe(&ring_, &cqe);
 		} else if (timeout_ms == 0) {
 			rc = io_uring_peek_cqe(&ring_, &cqe);
-			if (rc == -EAGAIN) return false;
-		} else {
-			__kernel_timespec ts{}; ts.tv_sec = timeout_ms/1000; ts.tv_nsec = (timeout_ms%1000)*1000000L;
-			rc = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
-		}
-		if (rc != 0 || !cqe) return false;
-		// Process one and drain remaining without blocking
-		handle_cqe(cqe);
-		while (io_uring_peek_cqe(&ring_, &cqe) == 0 && cqe) {
-			handle_cqe(cqe);
-		}
-		return true;
-	}
-
-	bool init(const NetCallbacks &cbs) override {
-		cbs_ = cbs;
-		io::suppress_sigpipe_once();
-		if (io_uring_queue_init(256, &ring_, 0) != 0)
-			return false;
-		ring_inited_ = true;
-		// Detect kernel support for IORING_OP_CONNECT once
-		probe_ = io_uring_get_probe_ring(&ring_);
-		connect_supported_ = (probe_ && io_uring_opcode_supported(probe_, IORING_OP_CONNECT));
-		// user eventfd for wake()/post(): efficient counter
-		user_efd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-		if (user_efd_ < 0) return false;
-		// register read on eventfd via io_uring
-		submit_read_user();
-		return true;
-	}
-
-	
+						if (res >= 0) {
+							int err = 0; socklen_t len = sizeof(err);
+							int gs = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+							if (gs < 0) {
+								int e = errno;
+								IO_LOG_ERR("getsockopt(SO_ERROR fd=%d) failed errno=%d (%s)", (int)fd, e, std::strerror(e));
+								err = e;
+							} else {
+								IO_LOG_DBG("connect completion fd=%d, SO_ERROR=%d (%s)", (int)fd, err, std::strerror(err));
+							}
+							if (err == 0) {
+								IO_LOG_DBG("connect: established fd=%d", (int)fd);
+								stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
+								if (cbs_.on_accept) { IO_LOG_DBG("invoke on_accept(client) fd=%d", (int)fd); cbs_.on_accept(fd);} 
+								submit_recv(fd);
+							} else {
+								if (cbs_.on_close) cbs_.on_close(fd);
+								::close(fd);
+								sockets_.erase(fd);
+								stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
+							}
+						} else {
+							if (cbs_.on_close) cbs_.on_close(fd);
+							::close(fd);
+							sockets_.erase(fd);
+							stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
+						}
 
 	// Основной цикл обработки: блокируется на io_uring и проверяет run_flag
 	void event_loop(std::atomic<bool> &run_flag, int32_t wait_ms) override {
