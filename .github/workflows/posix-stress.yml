@@ -24,6 +24,14 @@ jobs:
           PRESET: debug
         run: |
           bash scripts/stress_matrix.sh Debug
+      - name: Upload stress logs (Linux)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-stress-logs
+          path: |
+            build/**/stress/*.log
+            build/**/stress/parallel_*.log
 
   macos:
     runs-on: macos-latest
@@ -42,3 +50,11 @@ jobs:
           PRESET: debug
         run: |
           bash scripts/stress_matrix.sh Debug
+      - name: Upload stress logs (macOS)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-stress-logs
+          path: |
+            build/**/stress/*.log
+            build/**/stress/parallel_*.log

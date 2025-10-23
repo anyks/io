@@ -151,7 +151,10 @@ class EpollEngine : public INetEngine {
 							if (cbs_.on_close) cbs_.on_close(fd);
 							(void)::epoll_ctl(ep_, EPOLL_CTL_DEL, fd, nullptr); ::shutdown(fd, SHUT_RDWR); ::close(fd);
 							bool dec5=false; { auto itE=sockets_.find(fd); if (itE!=sockets_.end()) { size_t pend=(itE->second.out_queue.size()>itE->second.out_head)?(itE->second.out_queue.size()-itE->second.out_head):0; if(pend) stats_.send_dropped_bytes.fetch_add((uint64_t)pend, std::memory_order_relaxed); dec5=itE->second.server_side; sockets_.erase(itE);} }
-							if (dec5 && cur_conn_>0) cur_conn_--; auto itT=timers_.find(fd); if (itT!=timers_.end()) { int tfd=itT->second; (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} timeouts_ms_.erase(fd);
+							if (dec5 && cur_conn_>0) { cur_conn_--; }
+							auto itT=timers_.find(fd);
+							if (itT!=timers_.end()) { int tfd=itT->second; (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} 
+							timeouts_ms_.erase(fd);
 							stats_.closes.fetch_add(1, std::memory_order_relaxed);
 							continue;
 						}
@@ -312,7 +315,7 @@ class EpollEngine : public INetEngine {
 			}
 			if (events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLERR)) {
 				auto it = sockets_.find(fd); if (it == sockets_.end()) continue; auto st = it->second;
-				int has_cb = st.read_cb ? 1 : 0;
+				int has_cb = st.read_cb ? 1 : 0; (void)has_cb; // suppress unused when DBG disabled
 				IO_LOG_DBG("event fd=%d ev=%s%s%s%s, connecting=%d, active=%d, has_cb=%d, buf=%p, size=%zu",
 				           fd,
 				           (events & EPOLLIN) ? "IN" : "",
@@ -530,15 +533,18 @@ class EpollEngine : public INetEngine {
 		if (cur < 0)
 			cur = 0;
 		fcntl(fd, F_SETFL, cur | O_NONBLOCK);
-		if (r == 0) {
+					if (wn < 0) {
 			// Успешное соединение установлено сразу. Не трогаем sockets_[fd],
 			// чтобы не потерять buffer/callback, заданные через add_socket.
 			// Лишь убеждаемся, что сокет подписан на чтение в epoll и активен.
 			auto it = sockets_.find(fd);
 			if (it != sockets_.end())
 				it->second.active = true;
-			epoll_event ev{};
-			auto it2 = sockets_.find(fd);
+							bool dec5=false; { auto itE=sockets_.find(fd); if (itE!=sockets_.end()) { dec5=itE->second.server_side; sockets_.erase(itE);} }
+							if (dec5 && cur_conn_>0) { cur_conn_--; }
+							auto itT=timers_.find(fd);
+							if (itT!=timers_.end()) { int tfd=itT->second; (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} 
+							timeouts_ms_.erase(fd);
 			bool paused = (it2 != sockets_.end()) ? it2->second.paused : false;
 			ev.events = (paused ? 0u : EPOLLIN) | EPOLLRDHUP;
 			ev.data.fd = fd;
