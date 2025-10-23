@@ -9,12 +9,15 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/devpoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <chrono>
+#include <mutex>
 
 // Logging: errors in Debug, debug gated by IO_ENABLE_DEVPOLL_VERBOSE
 #ifndef NDEBUG
@@ -87,7 +90,16 @@ class DevPollEngine : public INetEngine {
 		if (flags < 0)
 			flags = 0;
 		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-		sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false, false};
+		// Construct state in-place to avoid copying non-copyable std::atomic members
+		auto [it, inserted] = sockets_.try_emplace(fd);
+		auto &st = it->second;
+		st.buf = buffer;
+		st.buf_size = buffer_size;
+		st.read_cb = std::move(cb);
+		st.out_queue.clear();
+		st.want_write = false;
+		st.connecting = false;
+		st.paused = false;
 		add_poll(fd, POLLIN | POLLRDNORM | POLLHUP);
 		return true;
 	}
@@ -197,11 +209,20 @@ class DevPollEngine : public INetEngine {
 		return true;
 	}
 	bool post(uint32_t val) override {
-		if (user_pipe_[1] == -1)
-			return false;
-		ssize_t n = ::write(user_pipe_[1], &val, sizeof(val));
-		if (n == (ssize_t)sizeof(val)) { stats_.user_events.fetch_add(1, std::memory_order_relaxed); return true; }
-		return false;
+		// Count logical user events and best-effort wake the loop via a single-byte pipe poke.
+		// Enqueue value and wake the loop once when transitioning from empty.
+		stats_.user_events.fetch_add(1, std::memory_order_relaxed);
+		bool need_wake = false;
+		{
+			std::lock_guard<std::mutex> lk(user_mtx_);
+			need_wake = user_vals_.empty();
+			user_vals_.push_back(val);
+		}
+		if (need_wake && user_pipe_[1] != -1) {
+			uint8_t b = 1;
+			(void)::write(user_pipe_[1], &b, sizeof(b)); // ignore EAGAIN
+		}
+		return true;
 	}
 	// IOCP-specific APIs: provide no-op implementations for non-IOCP backends
 	bool set_accept_depth(socket_t /*listen_socket*/, uint32_t /*depth*/) override { return true; }
@@ -245,6 +266,9 @@ class DevPollEngine : public INetEngine {
 	int dpfd_{-1};
 	NetCallbacks cbs_{};
 	int user_pipe_[2]{-1, -1};
+	std::atomic<uint64_t> user_pending_{0};
+	std::mutex user_mtx_;
+	std::deque<uint32_t> user_vals_;
 	std::unordered_map<socket_t, SockState> sockets_;
 	std::unordered_set<socket_t> listeners_;
 	std::unordered_map<socket_t, uint32_t> timeouts_ms_;
@@ -324,10 +348,17 @@ class DevPollEngine : public INetEngine {
 				int fd = evs[i].fd;
 				short re = evs[i].revents;
 				if (fd == user_pipe_[0] && (re & POLLIN)) {
-					uint32_t v;
-					while (::read(user_pipe_[0], &v, sizeof(v)) == sizeof(v)) {
-						if (cbs_.on_user)
-							cbs_.on_user(v);
+					// Drain the pipe (edge-triggered)
+					uint8_t tmp[256];
+					while (::read(user_pipe_[0], tmp, sizeof(tmp)) > 0) {}
+					// Move pending values out and deliver
+					std::deque<uint32_t> pending;
+					{
+						std::lock_guard<std::mutex> lk(user_mtx_);
+						pending.swap(user_vals_);
+					}
+					for (auto v : pending) {
+						if (cbs_.on_user) cbs_.on_user(v);
 					}
 					continue;
 				}
@@ -356,11 +387,8 @@ class DevPollEngine : public INetEngine {
 						if (fl < 0)
 							fl = 0;
 						fcntl(client, F_SETFL, fl | O_NONBLOCK);
-						// Предрегистрация клиента в sockets_ с пустым буфером до add_socket
-						{
-							SockState st{}; st.buf=nullptr; st.buf_size=0; st.read_cb = ReadCallback{};
-							sockets_.emplace((socket_t)client, std::move(st));
-						}
+						// Предрегистрация клиента в sockets_ с пустым буфером до add_socket (in-place)
+						sockets_.try_emplace((socket_t)client);
 						cur_conn_++;
 						{
 							auto cur = (uint64_t)cur_conn_.load(std::memory_order_relaxed);
@@ -416,7 +444,7 @@ class DevPollEngine : public INetEngine {
 					if (it == sockets_.end()) {
 						continue;
 					}
-					auto st = it->second;
+					auto &st = it->second;
 					bool paused = st.paused;
 					if (paused)
 						continue;

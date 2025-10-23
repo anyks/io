@@ -83,7 +83,16 @@ class EventPortsEngine : public INetEngine {
         int flags = fcntl(fd, F_GETFL, 0);
         if (flags < 0) flags = 0;
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        sockets_[fd] = SockState{buffer, buffer_size, std::move(cb), {}, false, false, false};
+        // Construct in-place to avoid copying non-copyable atomics
+        auto [it, inserted] = sockets_.try_emplace(fd);
+        auto &st = it->second;
+        st.buf = buffer;
+        st.buf_size = buffer_size;
+        st.read_cb = std::move(cb);
+        st.out_queue.clear();
+        st.want_write.store(false, std::memory_order_relaxed);
+        st.connecting.store(false, std::memory_order_relaxed);
+        st.paused.store(false, std::memory_order_relaxed);
         short mask = POLLIN | POLLHUP;
         (void)::port_associate(port_, PORT_SOURCE_FD, fd, mask, nullptr);
         return true;
@@ -346,14 +355,8 @@ class EventPortsEngine : public INetEngine {
                         int fl = fcntl(client, F_GETFL, 0);
                         if (fl < 0) fl = 0;
                         fcntl(client, F_SETFL, fl | O_NONBLOCK);
-                        // preregister client in sockets_
-                        {
-                            SockState st{};
-                            st.buf = nullptr;
-                            st.buf_size = 0;
-                            st.read_cb = ReadCallback{};
-                            sockets_.emplace((socket_t)client, std::move(st));
-                        }
+                        // preregister client in sockets_ (construct in-place)
+                        sockets_.try_emplace((socket_t)client);
                         cur_conn_++;
                         IO_LOG_DBG("accept: client fd=%d", (int)client);
                         if (cbs_.on_accept) cbs_.on_accept(client);
@@ -400,12 +403,15 @@ class EventPortsEngine : public INetEngine {
                 if (ev.portev_events & POLLIN) {
                     auto it = sockets_.find(fd);
                     if (it != sockets_.end()) {
-                        auto st = it->second;
-                        bool paused_now = st.paused;
-                        if (st.buf && st.read_cb && st.buf_size > 0 && !paused_now) {
-                            ssize_t rn = ::recv(fd, st.buf, st.buf_size, 0);
+                        auto &st_ref = it->second;
+                        bool paused_now = st_ref.paused.load(std::memory_order_relaxed);
+                        char *buf = st_ref.buf;
+                        size_t buf_size = st_ref.buf_size;
+                        ReadCallback cb = st_ref.read_cb; // copy callable; safe if state mutates inside
+                        if (buf && cb && buf_size > 0 && !paused_now) {
+                            ssize_t rn = ::recv(fd, buf, buf_size, 0);
                             if (rn > 0) {
-                                st.read_cb(fd, st.buf, (size_t)rn);
+                                cb(fd, buf, (size_t)rn);
                                 auto itT = timers_.find(fd);
                                 if (itT != timers_.end()) {
                                     uint32_t ms = itT->second.ms;

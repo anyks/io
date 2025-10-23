@@ -517,8 +517,7 @@ class EpollEngine : public INetEngine {
 		if (::inet_pton(AF_INET, host, &addr.sin_addr) != 1)
 			return false;
 		int flags = fcntl(fd, F_GETFL, 0);
-		if (flags < 0)
-			flags = 0;
+		if (flags < 0) flags = 0;
 		if (!async) {
 			if (flags & O_NONBLOCK)
 				fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
@@ -526,37 +525,29 @@ class EpollEngine : public INetEngine {
 		int r = ::connect(fd, (sockaddr *)&addr, sizeof(addr));
 		int err = (r == 0) ? 0 : errno;
 #ifndef NDEBUG
-		IO_LOG_DBG("connect start fd=%d, async=%d, res=%d, errno=%d (%s)", (int)fd, async ? 1 : 0, r, err,
-		           std::strerror(err));
+		IO_LOG_DBG("connect start fd=%d, async=%d, res=%d, errno=%d (%s)", (int)fd, async ? 1 : 0, r, err, std::strerror(err));
 #endif
 		int cur = fcntl(fd, F_GETFL, 0);
-		if (cur < 0)
-			cur = 0;
+		if (cur < 0) cur = 0;
 		fcntl(fd, F_SETFL, cur | O_NONBLOCK);
-					if (wn < 0) {
-			// Успешное соединение установлено сразу. Не трогаем sockets_[fd],
-			// чтобы не потерять buffer/callback, заданные через add_socket.
-			// Лишь убеждаемся, что сокет подписан на чтение в epoll и активен.
+
+		// Immediate success
+		if (r == 0 || err == EISCONN) {
 			auto it = sockets_.find(fd);
-			if (it != sockets_.end())
-				it->second.active = true;
-							bool dec5=false; { auto itE=sockets_.find(fd); if (itE!=sockets_.end()) { dec5=itE->second.server_side; sockets_.erase(itE);} }
-							if (dec5 && cur_conn_>0) { cur_conn_--; }
-							auto itT=timers_.find(fd);
-							if (itT!=timers_.end()) { int tfd=itT->second; (void)::epoll_ctl(ep_, EPOLL_CTL_DEL, tfd, nullptr); ::close(tfd); owner_.erase(tfd); timers_.erase(itT);} 
-							timeouts_ms_.erase(fd);
-			bool paused = (it2 != sockets_.end()) ? it2->second.paused : false;
+			if (it != sockets_.end()) it->second.active = true;
+			epoll_event ev{};
+			bool paused = (it != sockets_.end()) ? it->second.paused : false;
 			ev.events = (paused ? 0u : EPOLLIN) | EPOLLRDHUP;
 			ev.data.fd = fd;
-			// Попробуем MOD, если ещё не добавлен — fallback на ADD (ошибки игнорируем).
 			(void)::epoll_ctl(ep_, EPOLL_CTL_MOD, fd, &ev);
 			(void)::epoll_ctl(ep_, EPOLL_CTL_ADD, fd, &ev);
-			if (cbs_.on_accept)
-				cbs_.on_accept(fd);
+			if (cbs_.on_accept) cbs_.on_accept(fd);
 			stats_.connects_ok.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		}
-		if (async && err == EINPROGRESS) {
+
+		// Async in-progress
+		if (async && (err == EINPROGRESS || err == EALREADY)) {
 			auto it = sockets_.find(fd);
 			if (it == sockets_.end()) {
 				SockState st;
@@ -585,7 +576,7 @@ class EpollEngine : public INetEngine {
 			}
 			return true;
 		}
-		// immediate failure path (not in-progress)
+		// Immediate failure path (not in-progress)
 		IO_LOG_ERR("connect(fd=%d) failed, res=%d, errno=%d (%s)", (int)fd, r, err, std::strerror(err));
 		stats_.connects_fail.fetch_add(1, std::memory_order_relaxed);
 		return false;
