@@ -61,8 +61,9 @@ DATASET_TOTAL_MB=${IO_DATASET_TOTAL_MB:-100}
 echo "[bench/linux] target=$LINUX_SSH port=${LINUX_SSH_PORT:-22} backend=$BACKEND"
 echo "[bench/linux][$BACKEND] configure Release with benchmarks"
 EXTRA_VERBOSE=""
-if [[ "$BACKEND" == "io_uring" ]]; then
-  EXTRA_VERBOSE="-DIO_ENABLE_IOURING_VERBOSE=ON"
+# Optional explicit verbose override via env IO_VERBOSE={0,1}
+if [[ "${IO_VERBOSE:-0}" == "1" ]]; then
+  if [[ "$BACKEND" == "io_uring" ]]; then EXTRA_VERBOSE="-DIO_ENABLE_IOURING_VERBOSE=ON"; fi
 fi
 remote "set -e; cd '$LINUX_DIR'; if command -v g++ >/dev/null 2>&1; then export CXX=g++; export CC=gcc; elif command -v clang++ >/dev/null 2>&1; then export CXX=clang++; export CC=clang; fi; if command -v ninja >/dev/null 2>&1; then cmake -S . -B build/$BUILD_SUBDIR -G Ninja -DIO_BUILD_TESTS=ON -DIO_BUILD_BENCHMARKS=ON $IOURING_FLAG $EXTRA_VERBOSE -DCMAKE_BUILD_TYPE=Release; else cmake -S . -B build/$BUILD_SUBDIR -G 'Unix Makefiles' -DIO_BUILD_TESTS=ON -DIO_BUILD_BENCHMARKS=ON $IOURING_FLAG $EXTRA_VERBOSE -DCMAKE_BUILD_TYPE=Release; fi"
 
@@ -74,7 +75,11 @@ remote "set -e; cd '$LINUX_DIR'; mkdir -p '$DATASET_DIR'; if [ -z \"$(ls -A '$DA
 
 echo "[bench/linux][$BACKEND] run EPS benchmark ($((CLIENTS*MSGS)) msgs)"
 LOG_NAME="bench_${BACKEND}.log"
-remote "set -e; cd '$LINUX_DIR'; IO_BENCH_DATASET_DIR='$DATASET_DIR' IO_BENCH_MIN_MB='$MIN_MB' IO_BENCH_MAX_MB='$MAX_MB' IO_BENCH_CLIENTS='$CLIENTS' IO_BENCH_MSGS='$MSGS' IO_BENCH_PIPELINE='$PIPELINE' IO_BENCH_TIMEOUT='$TIMEOUT' IO_BENCH_SEED='$SEED' build/$BUILD_SUBDIR/io_tests --gtest_filter=EpsBenchmark.LoadEchoRandomLarge 2>&1 | tee $LOG_NAME"
+# Optionally pass progress period and trace client overrides to remote env
+EXTRA_ENV=""
+if [[ -n "${IO_BENCH_PROGRESS_SEC:-}" ]]; then EXTRA_ENV+=" IO_BENCH_PROGRESS_SEC='${IO_BENCH_PROGRESS_SEC}'"; fi
+if [[ -n "${IO_BENCH_TRACE_CLIENT:-}" ]]; then EXTRA_ENV+=" IO_BENCH_TRACE_CLIENT='${IO_BENCH_TRACE_CLIENT}'"; fi
+remote "set -e; cd '$LINUX_DIR'; IO_BENCH_DATASET_DIR='$DATASET_DIR' IO_BENCH_MIN_MB='$MIN_MB' IO_BENCH_MAX_MB='$MAX_MB' IO_BENCH_CLIENTS='$CLIENTS' IO_BENCH_MSGS='$MSGS' IO_BENCH_PIPELINE='$PIPELINE' IO_BENCH_TIMEOUT='$TIMEOUT' IO_BENCH_SEED='$SEED' $EXTRA_ENV build/$BUILD_SUBDIR/io_tests --gtest_filter=EpsBenchmark.LoadEchoRandomLarge 2>&1 | tee $LOG_NAME"
 
 echo "[bench/linux] fetch results"
 scp ${SSH_KEY:+-i "$SSH_KEY"} ${LINUX_SSH_PORT:+-P "$LINUX_SSH_PORT"} "$LINUX_SSH:$LINUX_DIR/$LOG_NAME" ./ || true

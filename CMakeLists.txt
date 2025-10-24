@@ -11,6 +11,7 @@ project(io LANGUAGES CXX VERSION 0.1.0)
 # Options
 option(IO_BUILD_TESTS "Build tests" ON)
 option(IO_BUILD_EXAMPLES "Build examples" ON)
+option(IO_BUILD_BENCHMARKS "Build benchmark tools and tests" OFF)
 option(IO_WITH_IOURING "Use io_uring on Linux" OFF)
 option(IO_WITH_EVENTPORTS "Use Event Ports on Solaris" ON)
 option(IO_WITH_IOCP_WIN "Use IOCP backend on Windows (real implementation)" ON)
@@ -196,12 +197,20 @@ if (IO_BUILD_TESTS)
       tests/net_egain_partial_write_tests.cpp
       tests/io_linux_metrics_tests.cpp
     )
+    if (IO_BUILD_BENCHMARKS)
+      target_sources(io_tests PRIVATE tests/net_eps_benchmark_tests.cpp)
+    endif()
     target_link_libraries(io_tests PRIVATE io GTest::gtest_main)
   endif()
   include(GoogleTest)
   # Ensure tests won't hang forever: set a per-test timeout (can be overridden by CTest args or per-test props)
   set(IO_TEST_TIMEOUT 180 CACHE STRING "Default timeout (s) for each test")
   gtest_discover_tests(io_tests PROPERTIES TIMEOUT ${IO_TEST_TIMEOUT})
+endif()
+
+# Benchmarks and tools
+if (IO_BUILD_BENCHMARKS)
+  add_executable(gen_dataset tools/gen_dataset.cpp)
 endif()
 
 # Install rules

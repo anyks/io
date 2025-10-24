@@ -14,10 +14,12 @@
 #include <string>
 #include <sys/socket.h>
 #include <thread>
+#include <iostream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <algorithm>
+#include <cstdarg>
 
 using namespace std::chrono_literals;
 
@@ -93,6 +95,8 @@ TEST(EpsBenchmark, LoadEchoRandomLarge) {
     uint64_t SEED = 42;                  // deterministic seed across backends
     int CONNECT_TIMEOUT_MS = 10000;      // connect phase timeout
     int RUN_TIMEOUT_MS = 120000;         // run phase timeout (2 minutes) for large payloads
+    int PROGRESS_SEC = 5;                // progress print period in seconds (env-overridable)
+    // Progress will be computed directly in the recv callback.
 
     if (const char *s = std::getenv("IO_BENCH_CLIENTS")) { int v = std::atoi(s); if (v > 0) N = v; }
     if (const char *s = std::getenv("IO_BENCH_MSGS"))    { int v = std::atoi(s); if (v > 0) R = v; }
@@ -104,6 +108,11 @@ TEST(EpsBenchmark, LoadEchoRandomLarge) {
     if (const char *s = std::getenv("IO_BENCH_BUF"))     { long v = std::atol(s); if (v >= 4*1024) RECV_BUF = (size_t)v; }
     if (const char *s = std::getenv("IO_BENCH_SEED"))    { unsigned long long v = std::strtoull(s, nullptr, 10); SEED = (uint64_t)v; }
     if (const char *s = std::getenv("IO_BENCH_TIMEOUT")) { int v = std::atoi(s); if (v > 0) RUN_TIMEOUT_MS = v; }
+    if (const char *s = std::getenv("IO_BENCH_PROGRESS_SEC")) { int v = std::atoi(s); if (v >= 1 && v <= 60) PROGRESS_SEC = v; }
+    // No tracer or markers used.
+
+    // Total messages (for progress prints)
+    const uint64_t TOTAL_MSGS = (uint64_t)N * (uint64_t)R;
 
     // Optional dataset directory: preload payloads from files for deterministic cross-backend data
     namespace fs = std::filesystem;
@@ -235,20 +244,32 @@ TEST(EpsBenchmark, LoadEchoRandomLarge) {
                 (void)engine->write(cl.fd, cl.tx.data(), sz);
             }
         } else {
-            // MB mode: use whole dataset file or generated buffer of size mp.size
+            // MB mode: use whole dataset file or generated buffer of EXACT size mp.size
             size_t didx = pick_dataset_index(ci, idx);
             if (didx != (size_t)-1) {
                 auto &data = dataset[didx];
                 mp.size = data.size(); mp.send_left = mp.size; mp.recv_left = mp.size;
-                (void)engine->write(cl.fd, data.data(), data.size());
+                (void)engine->write(cl.fd, data.data(), mp.size);
             } else {
-                if (cl.tx.size() < mp.size) cl.tx.resize(mp.size);
+                // Ensure buffer length exactly equals mp.size before writing
+                if (cl.tx.size() != mp.size) cl.tx.resize(mp.size);
                 fill_payload(cl.tx, (uint64_t)SEED ^ ((uint64_t)ci << 32) ^ (uint64_t)idx);
                 mp.send_left = mp.size; mp.recv_left = mp.size;
-                (void)engine->write(cl.fd, cl.tx.data(), cl.tx.size());
+                (void)engine->write(cl.fd, cl.tx.data(), mp.size);
             }
         }
     };
+
+    // Shared progress state for EPS computed in the recv callback
+    struct ProgressState {
+        std::mutex m;
+        std::chrono::system_clock::time_point bench_start_sys;
+        std::chrono::steady_clock::time_point last_prog;
+        uint64_t last_recvs{0};
+        uint64_t last_bytes{0};
+    } prog;
+    std::atomic<uint64_t> total_recvs{0};
+    std::atomic<uint64_t> total_bytes{0};
 
     // Engine callbacks
     NetCallbacks cbs{};
@@ -328,9 +349,59 @@ TEST(EpsBenchmark, LoadEchoRandomLarge) {
                 size_t take = std::min(mp.recv_left, n);
                 mp.recv_left -= take; n -= take; b += take;
                 cl.bytes_received += take;
+                total_bytes.fetch_add(take, std::memory_order_relaxed);
                 if (mp.recv_left == 0) {
                     cl.recvs_completed++;
                     cl.next_recv_idx++;
+                    total_recvs.fetch_add(1, std::memory_order_relaxed);
+
+                    // Inline EPS progress every PROGRESS_SEC seconds
+                    if (PROGRESS_SEC > 0) {
+                        auto now_st = std::chrono::steady_clock::now();
+                        bool do_print = false;
+                        {
+                            std::lock_guard<std::mutex> lk(prog.m);
+                            if (prog.bench_start_sys.time_since_epoch().count() != 0) {
+                                if (now_st - prog.last_prog >= std::chrono::seconds(PROGRESS_SEC)) {
+                                    prog.last_prog = now_st;
+                                    do_print = true;
+                                }
+                            }
+                        }
+                        if (do_print) {
+                            uint64_t recvs = total_recvs.load(std::memory_order_relaxed);
+                            uint64_t bytes = total_bytes.load(std::memory_order_relaxed);
+                            auto now_sys = std::chrono::system_clock::now();
+                            double now_ts = std::chrono::duration_cast<std::chrono::duration<double>>(now_sys.time_since_epoch()).count();
+                            double start_ts = std::chrono::duration_cast<std::chrono::duration<double>>(prog.bench_start_sys.time_since_epoch()).count();
+                            double secs = now_ts - start_ts; if (secs <= 0.0) secs = 1e-9;
+                            double eps_avg = (double)recvs / secs;
+                            double eps_5s, mbps_5s; double msgs_5s;
+                            {
+                                std::lock_guard<std::mutex> lk(prog.m);
+                                double msgs_interval = (double)(recvs - prog.last_recvs);
+                                msgs_5s = msgs_interval * (5.0 / (double)PROGRESS_SEC);
+                                eps_5s = msgs_5s / 5.0;
+                                mbps_5s = ((double)(bytes - prog.last_bytes) / (1024.0 * 1024.0)) * (5.0 / (double)PROGRESS_SEC);
+                                prog.last_recvs = recvs;
+                                prog.last_bytes = bytes;
+                            }
+                            const char *fmt =
+                                "EPS_PROGRESS backend=%s recvs=%llu/%llu duration_s=%.2f interval_s=%.2f msgs_5s=%.0f eps_avg=%.2f eps_5s=%.2f mbps_5s=%.2f\n";
+                            std::fprintf(stdout, fmt,
+                                         backend_name().c_str(),
+                                         (unsigned long long)recvs,
+                                         (unsigned long long)TOTAL_MSGS,
+                                         secs,
+                                         (double)PROGRESS_SEC,
+                                         msgs_5s,
+                                         eps_avg,
+                                         eps_5s,
+                                         mbps_5s);
+                            std::fflush(stdout);
+                        }
+                    }
+
                     // Keep the window full: when a message completes, send next if available
                     if ((int)cl.next_send_idx < R) {
                         size_t inflight = (cl.next_send_idx >= cl.next_recv_idx) ? (cl.next_send_idx - cl.next_recv_idx) : 0;
@@ -364,6 +435,14 @@ TEST(EpsBenchmark, LoadEchoRandomLarge) {
 
     // Measure start time (Unix timestamp) BEFORE kicking off first sends
     auto bench_start_tp = std::chrono::system_clock::now();
+    // Initialize progress state for recv-callback prints
+    {
+        std::lock_guard<std::mutex> lk(prog.m);
+        prog.bench_start_sys = bench_start_tp;
+        prog.last_prog = std::chrono::steady_clock::now();
+        prog.last_recvs = 0;
+        prog.last_bytes = 0;
+    }
 
     // Kick off initial window per client (up to PIPELINE in-flight messages)
     for (int i = 0; i < N; ++i) {
@@ -378,17 +457,14 @@ TEST(EpsBenchmark, LoadEchoRandomLarge) {
         }
     }
 
+    // Initial window armed for all clients
+
     // Also keep a steady_clock anchor for timeout tracking
     auto run_start_steady = std::chrono::steady_clock::now();
 
     // Measure loop until all messages are received back
 
     const uint64_t total_msgs = (uint64_t)N * (uint64_t)R;
-    uint64_t sends_done_prev = 0, recvs_done_prev = 0;
-    auto last_progress_tp = std::chrono::steady_clock::now();
-    auto next_progress_tp = last_progress_tp + std::chrono::seconds(5);
-    uint64_t last_recvs = 0;
-    uint64_t last_bytes = 0;
     while (true) {
         uint64_t sends_done = 0, recvs_done = 0;
         uint64_t bytes_done = 0;
@@ -399,48 +475,6 @@ TEST(EpsBenchmark, LoadEchoRandomLarge) {
                           << ", recvs=" << recvs_done << "/" << total_msgs;
             break;
         }
-        // Periodic progress report every ~5 seconds
-        auto now_steady = std::chrono::steady_clock::now();
-        if (now_steady >= next_progress_tp) {
-            auto now_sys = std::chrono::system_clock::now();
-            double now_ts = std::chrono::duration_cast<std::chrono::duration<double>>(now_sys.time_since_epoch()).count();
-            double start_ts = std::chrono::duration_cast<std::chrono::duration<double>>(bench_start_tp.time_since_epoch()).count();
-            double secs = now_ts - start_ts; if (secs <= 0.0) secs = 1e-9;
-            double eps_avg = (double)recvs_done / secs;
-            // Instantaneous over the nominal 5-second window (normalize to 5.0s)
-            double interval_s = std::chrono::duration_cast<std::chrono::duration<double>>(now_steady - last_progress_tp).count();
-            if (interval_s <= 0.0) interval_s = 1e-9;
-            double eps_5s = (double)(recvs_done - last_recvs) / 5.0;
-            double mbps_5s = ((double)(bytes_done - last_bytes) / (1024.0 * 1024.0)) / 5.0;
-            const char *fmt =
-                "EPS_PROGRESS backend=%s recvs=%llu/%llu duration_s=%.2f interval_s=%.2f eps_avg=%.2f eps_5s=%.2f mbps_5s=%.2f\n";
-            std::fprintf(stdout, fmt,
-                         backend_name().c_str(),
-                         (unsigned long long)recvs_done,
-                         (unsigned long long)total_msgs,
-                         secs,
-                         interval_s,
-                         eps_avg,
-                         eps_5s,
-                         mbps_5s);
-            std::fflush(stdout);
-            // Дублируем прогресс в stderr, чтобы он был виден даже при агрессивном буферизовании stdout
-            std::fprintf(stderr, fmt,
-                         backend_name().c_str(),
-                         (unsigned long long)recvs_done,
-                         (unsigned long long)total_msgs,
-                         secs,
-                         interval_s,
-                         eps_avg,
-                         eps_5s,
-                         mbps_5s);
-            std::fflush(stderr);
-            last_progress_tp = now_steady;
-            next_progress_tp = last_progress_tp + std::chrono::seconds(5);
-            last_recvs = recvs_done;
-            last_bytes = bytes_done;
-        }
-        sends_done_prev = sends_done; recvs_done_prev = recvs_done;
         if (!engine->loop_once(5)) std::this_thread::sleep_for(1ms);
     }
     auto bench_end_tp = std::chrono::system_clock::now();
@@ -450,20 +484,20 @@ TEST(EpsBenchmark, LoadEchoRandomLarge) {
     double secs = end_ts - start_ts;
     if (secs <= 0.0) secs = 1e-9;
 
-    uint64_t sends_total = 0, recvs_total = 0; uint64_t total_bytes = 0;
+    uint64_t sends_total = 0, recvs_total = 0; uint64_t bytes_total_sum = 0;
     for (int i = 0; i < N; ++i) {
         sends_total += clients[i].sends_completed;
         recvs_total += clients[i].recvs_completed;
-        for (auto &mp : clients[i].plan) total_bytes += (uint64_t)mp.size;
+        for (auto &mp : clients[i].plan) bytes_total_sum += (uint64_t)mp.size;
     }
     // Single end-to-end EPS based on completed roundtrips (full echo received)
     double eps = (double)recvs_total / secs;
 
-    // Print a parse-friendly result line
+    // Print a parse-friendly result line (stdout only)
     std::fprintf(stdout,
                  "EPS_RESULT backend=%s clients=%d msgs_per_client=%d min_mb=%d max_mb=%d pipeline=%d duration_s=%.6f start_ts=%.6f end_ts=%.6f eps=%.2f bytes_total=%llu\n",
                  backend_name().c_str(), N, R, MIN_MB, MAX_MB, PIPELINE, secs, start_ts, end_ts, eps,
-                 (unsigned long long)total_bytes);
+                 (unsigned long long)bytes_total_sum);
 
     // Expectations: at least one message per second per client (very conservative lower bound)
     EXPECT_GT(recvs_total, 0u);
